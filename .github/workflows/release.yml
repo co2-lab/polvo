@@ -20,14 +20,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install git-cliff
+        run: |
+          curl -fsSL https://github.com/orhun/git-cliff/releases/download/v2.4.0/git-cliff-2.4.0-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz --strip-components=1 -C /usr/local/bin git-cliff-2.4.0-x86_64-unknown-linux-musl/git-cliff
+
       - name: Generate changelog with git-cliff
         id: cliff
-        uses: orhun/git-cliff-action@v3
-        with:
-          config: cliff.toml
-          args: --latest --strip header
-        env:
-          OUTPUT: RELEASE_NOTES.md
+        run: |
+          git-cliff --config cliff.toml --latest --strip header --output RELEASE_NOTES.md
+          echo "content<<EOF" >> $GITHUB_OUTPUT
+          cat RELEASE_NOTES.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Upload release notes
         uses: actions/upload-artifact@v4
@@ -225,11 +229,13 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install git-cliff
+        run: |
+          curl -fsSL https://github.com/orhun/git-cliff/releases/download/v2.4.0/git-cliff-2.4.0-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz --strip-components=1 -C /usr/local/bin git-cliff-2.4.0-x86_64-unknown-linux-musl/git-cliff
+
       - name: Update CHANGELOG with git-cliff
-        uses: orhun/git-cliff-action@v3
-        with:
-          config: cliff.toml
-          args: --output CHANGELOG.md
+        run: git-cliff --config cliff.toml --output CHANGELOG.md
 
       - name: Commit CHANGELOG
         env:
