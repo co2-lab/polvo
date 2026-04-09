@@ -20,8 +20,8 @@ AGENTS.md
 CLAUDE.md
 
 # Go binaries
-polvo
-server
+/polvo
+/server
 bin/
 app/bin/
 app/polvo-ide
