@@ -115,6 +115,7 @@ jobs:
           TAG: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
         run: |
+          mkdir -p ../desktop/bin
           GOOS=darwin GOARCH=arm64 go build \
             -ldflags "-X main.Version=${TAG} -X main.CommitSHA=${SHA} -X main.BuildDate=$(date -u +%Y-%m-%d)" \
             -o ../desktop/bin/polvo-aarch64-apple-darwin \
@@ -123,6 +124,9 @@ jobs:
             -ldflags "-X main.Version=${TAG} -X main.CommitSHA=${SHA} -X main.BuildDate=$(date -u +%Y-%m-%d)" \
             -o ../desktop/bin/polvo-x86_64-apple-darwin \
             ./cmd/polvo
+          lipo -create -output ../desktop/bin/polvo-universal-apple-darwin \
+            ../desktop/bin/polvo-aarch64-apple-darwin \
+            ../desktop/bin/polvo-x86_64-apple-darwin
 
       - name: Build Go sidecar (Linux)
         if: matrix.platform == 'ubuntu-latest'
