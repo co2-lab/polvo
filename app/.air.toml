@@ -1,0 +1,33 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  # Comando de build (usando o comando do seu Makefile)
+  cmd = "go build -o ./tmp/main ./cmd/polvo"
+  # Binário gerado pelo build
+  bin = "tmp/main"
+  # Argumentos extras para o binário (ex: carregar um config específico)
+  args_bin = ["watch"]
+  # Monitorar estas extensões
+  include_ext = ["go", "yaml", "html", "css", "js"]
+  # Ignorar estas pastas
+  exclude_dir = ["bin", "tmp", "vendor", ".polvo", ".git", "docs"]
+  # Intervalo de atraso para evitar builds duplicados
+  delay = 1000 # ms
+  # Interromper o processo anterior se um novo build começar
+  stop_on_error = true
+  # Log de cores
+  log_color = true
+
+[log]
+  time = true
+
+[color]
+  main = "magenta"
+  watcher = "cyan"
+  build = "yellow"
+  runner = "green"
+
+[misc]
+  # Limpar o diretório tmp ao sair
+  clean_on_exit = true

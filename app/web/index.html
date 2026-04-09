@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>polvo</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:      #0a0f0c;
+  --bg2:     #0d1210;
+  --bg3:     #111a16;
+  --bg4:     #1a2420;
+  --border:  #1a3a2a;
+  --text:    #c9d1d9;
+  --dim:     #4a6a5a;
+  --green:   #00ffab;
+  --green2:  #3fb950;
+  --red:     #ff5e8e;
+  --yellow:  #d29922;
+  --blue:    #58a6ff;
+  --purple:  #bc8cff;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── Scrollbars ── */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* ══════════════════════════════════════
+   WELCOME SCREEN (unconfigured)
+══════════════════════════════════════ */
+#welcome {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  padding: 40px 20px;
+  overflow-y: auto;
+}
+
+/* Emblem */
+.emblem {
+  width: 180px;
+  height: 160px;
+  margin-bottom: 24px;
+}
+
+/* Wordmark */
+.wordmark {
+  color: var(--green);
+  font-size: 28px;
+  font-weight: bold;
+  letter-spacing: 0.15em;
+  margin-bottom: 8px;
+}
+
+.tagline {
+  color: var(--dim);
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.version-pill {
+  display: inline-block;
+  border: 1px solid var(--border);
+  color: var(--border);
+  font-size: 11px;
+  padding: 1px 12px;
+  border-radius: 10px;
+  margin-bottom: 28px;
+}
+
+.welcome-divider {
+  width: 120px;
+  height: 1px;
+  background: var(--border);
+  margin-bottom: 20px;
+}
+
+.no-config {
+  color: var(--red);
+  font-size: 13px;
+  font-weight: bold;
+  margin-bottom: 24px;
+}
+
+/* Command hints */
+.cmd-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 32px;
+}
+.cmd-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.cmd-name {
+  color: var(--green);
+  font-weight: bold;
+  font-size: 13px;
+  min-width: 80px;
+  text-align: right;
+}
+.cmd-desc {
+  color: var(--dim);
+  font-size: 13px;
+}
+
+.welcome-hint {
+  color: var(--border);
+  font-size: 11px;
+}
+
+/* ── Wizard Card ── */
+.wizard-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: 100%;
+  max-width: 480px;
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+}
+.wizard-title { font-size: 18px; font-weight: bold; color: var(--green); }
+.wizard-subtitle { font-size: 13px; color: var(--dim); margin-top: -12px; }
+
+.form-group { display: flex; flex-direction: column; gap: 8px; }
+.form-label { font-size: 11px; text-transform: uppercase; color: var(--dim); letter-spacing: 0.05em; }
+.form-input {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 10px 12px;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+}
+.form-input:focus { border-color: var(--blue); outline: none; }
+
+.provider-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.provider-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  padding: 8px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  transition: all 0.2s;
+}
+.provider-opt:hover { border-color: var(--dim); }
+.provider-opt.selected { border-color: var(--green); background: var(--bg4); box-shadow: 0 0 10px rgba(0, 255, 171, 0.1); }
+.provider-opt.selected::after { content: '✓'; color: var(--green); font-size: 10px; margin-left: auto; }
+.provider-opt input { display: none; }
+
+/* ══════════════════════════════════════
+   DASHBOARD (configured)
+══════════════════════════════════════ */
+#dashboard {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Header */
+header {
+  background: var(--bg4);
+  border-bottom: 1px solid var(--border);
+  padding: 8px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.header-logo { color: var(--green); font-weight: bold; font-size: 14px; }
+.badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+}
+.badge.green { border-color: var(--green2); color: var(--green2); }
+.badge.dim   { color: var(--dim); }
+.spacer { flex: 1; }
+.project-name { color: var(--dim); font-size: 12px; }
+
+/* Main 3-column grid */
+.grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 220px 1fr 260px;
+  grid-template-rows: 1fr auto;
+  overflow: hidden;
+}
+
+.panel {
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.panel:last-child { border-right: none; }
+
+.panel-header {
+  padding: 6px 12px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--dim);
+  background: var(--bg4);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.panel-body { flex: 1; overflow-y: auto; padding: 8px; }
+
+/* Agents */
+.agent-item {
+  padding: 6px 8px;
+  border-radius: 4px;
+  margin-bottom: 4px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+}
+.agent-item.running  { border-color: var(--blue); }
+.agent-item.done-ok  { border-color: var(--green2); opacity: .6; }
+.agent-item.done-err { border-color: var(--red); }
+.agent-name   { color: var(--blue); font-size: 12px; }
+.agent-file   { color: var(--dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-status { font-size: 11px; margin-top: 2px; }
+.status-ok  { color: var(--green2); }
+.status-err { color: var(--red); }
+
+/* Log */
+#log { font-size: 12px; padding: 8px 12px; }
+.log-line     { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
+.log-err      { color: var(--red); }
+.log-warn     { color: var(--yellow); }
+.log-dim      { color: var(--dim); }
+
+/* Reports */
+.report-item {
+  padding: 6px 8px;
+  border-radius: 4px;
+  margin-bottom: 4px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+}
+.report-item.approve { border-left-color: var(--green2); }
+.report-item.reject  { border-left-color: var(--red); }
+.report-item.info    { border-left-color: var(--blue); }
+.report-agent   { font-size: 12px; color: var(--purple); }
+.report-file    { font-size: 11px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.report-summary { font-size: 11px; margin-top: 2px; }
+.report-meta    { font-size: 10px; color: var(--dim); margin-top: 2px; }
+
+/* Footer */
+footer {
+  grid-column: 1 / -1;
+  background: var(--bg4);
+  border-top: 1px solid var(--border);
+  padding: 4px 12px;
+  display: flex;
+  gap: 16px;
+  font-size: 11px;
+  color: var(--dim);
+}
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; }
+.dot.ok  { background: var(--green2); }
+.dot.err { background: var(--red); }
+
+.nav-link {
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 11px;
+  text-decoration: none;
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+}
+.nav-link:hover { color: var(--text); border-color: var(--border); }
+.nav-link.active { color: var(--green); border-color: var(--green); }
+
+#config-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  gap: 12px;
+  overflow: hidden;
+}
+.yaml-editor {
+  background: var(--bg2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 12px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  resize: none;
+  flex: 1;
+  outline: none;
+}
+.yaml-editor:focus { border-color: var(--blue); }
+.config-actions { display: flex; gap: 10px; align-items: center; }
+.btn {
+  background: var(--green);
+  color: var(--bg);
+  border: none;
+  padding: 6px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: bold;
+  font-size: 12px;
+}
+.btn:hover { background: var(--green2); }
+.btn-dim { background: var(--bg3); color: var(--dim); border: 1px solid var(--border); }
+.btn-dim:hover { color: var(--text); border-color: var(--dim); }
+
+/* Status bar (bottom of welcome) */
+.status-bar {
+  background: var(--bg2);
+  border-top: 1px solid var(--border);
+  padding: 6px 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.sb-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--border);
+  padding: 2px 10px;
+  border-radius: 4px;
+  color: var(--dim);
+  font-size: 12px;
+}
+.sb-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dim); }
+
+.empty { color: var(--dim); font-size: 11px; padding: 8px; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinner {
+  display: inline-block; width: 10px; height: 10px;
+  border: 1.5px solid var(--border); border-top-color: var(--blue);
+  border-radius: 50%; animation: spin .8s linear infinite;
+  margin-right: 4px; vertical-align: middle;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+.pulse { animation: pulse 2s ease-in-out infinite; }
+</style>
+</head>
+<body>
+
+<!-- ══ WELCOME SCREEN ══ -->
+<div id="welcome" style="display:none">
+
+  <!-- Polvo emblem (SVG inline, tentacles + robot head, exact colors from mockup) -->
+  <svg class="emblem" viewBox="60 60 260 230" xmlns="http://www.w3.org/2000/svg">
+    <!-- Tentacle 1 -->
+    <path fill="#00ffab" opacity="0.85" d="M208.6 188.6 C209 189 209.6 189.2 209.8 189.4 L223 195.1 C224.8 195.7 226.8 195.5 228.7 195.4 C230 195.3 230.7 195 231.9 194.6 L243.6 189.4 L252.4 185.6 L256.1 184.1 L258.6 183.1 L264.3 180.9 L275.9 176.9 C276.3 176.8 276.5 176.7 276.9 176.7 C278.3 176.4 280 176.7 281.3 177 L288.4 179.2 L296.2 182.8 C297.9 183.9 301 186.6 302.2 188.1 L307 194.4 L309.2 198.4 L309.9 200.2 C310.2 200.9 310.2 201.4 310.6 202.1 L309.4 203.5 L309.4 210.6 C310.3 210.7 311.2 211.3 311.9 211.7 L311.8 212.7 C311.4 213.9 311.3 216.1 311 217.7 C310.9 218.2 310.8 218.1 310.8 218.7 L307.8 218.4 L306.2 220.5 L304.5 223.5 L304 224.3 L305.3 225.8 L306.5 227.3 C306.3 227.9 305.7 228.2 305.8 228.9 C305.7 229.2 305 230 304.8 230.2 C303.9 231.2 302.8 232.4 301.7 233.2 C301.4 233.3 299.8 232.1 298.9 231.1 C298.4 231.2 293.4 233.2 293.2 233.4 C292.8 234.4 293.2 236.7 293 238 C291.3 239 288.3 239.7 286 239.4 C285.9 239.1 285.8 237.9 285.8 237.5 L279.1 234.7 C278.7 235.2 278.3 236.1 277.9 236.7 C277.1 238.1 277.2 238.7 276.6 238.7 C276 238.7 276.3 238.4 276 238.3 L273.5 237.6 C272.7 237.3 270.9 236.7 270.4 236.3 C270.3 235.5 271.3 233.6 271.3 232.6 C270.3 231.9 267.2 228.9 266.4 228.4 C265.9 228.6 263.9 230 263.2 230.4 C262.7 230 260 225.6 259.7 224.8 C260 224.4 260.7 223.8 261.1 223.4 C261 222.8 259.6 217.4 259.3 217.1 L256 217 C255.9 216.1 256 214.5 256 213.5 C256 212.2 255.7 211.5 255.8 210.2 L258.7 209.9 C258.8 209.5 259.1 203.3 258.9 202.9 C258.3 202.3 257.8 202 257.7 200.8 C257.7 199.8 258.3 199 258.3 198 C257.7 198.2 257.2 198.8 256.9 199.2 C255.8 200.7 254.9 202 254 203.8 C251 210 249.2 212.4 251.9 218.9 C254.4 225.1 257.5 233.9 260.6 239.9 L266.9 253.4 C266.8 253.9 267.5 255.2 267.8 255.7 C268.7 257.3 267.7 257.1 270.4 257.7 L276.7 259 L282.5 260.2 C282.5 260.2 284.2 260.6 284.9 260.4 C286.8 260.7 288.7 261.1 290.5 261.5 C291.2 261.7 292.7 261.9 293.5 261.9 C295.4 261.9 295.8 260.9 296.5 260.1 L307.8 246.8 C314.7 238.5 318.2 231.2 320.9 220.7 C322.1 216 322.3 214.4 323.1 209.7 C323.5 207.7 323.6 204.9 323.8 203.8 C323.9 203.2 324.1 201.6 324.1 200.8 C324.1 199.6 324.3 198.9 324.3 197.8 C324.2 190.9 324 186 322.8 179.5 C321.8 174.5 320.3 169 317 165.7 C314.8 163.5 312.1 162.2 308.1 161.5 C306.3 161.1 304.2 161.1 302.1 160.8 L286.8 159.8 L280.5 160 L277.6 160.3 C273.1 160.7 270.9 161.1 266.6 162.3 C264 163.1 261.5 163.8 261.5 163.8 C261.1 163 260.4 162.2 260 161.2 L253.6 162.3 C252.6 163.2 253.8 164.3 252.5 165 L248.7 166.6 C247.4 167.2 246.3 165 245.5 164.9 C245 165 240.3 167.6 239.7 167.9 C239.6 168.5 239.5 168.9 239.5 169.3 C239.4 169.8 239.5 170.4 239.4 170.8 C239.3 171.5 238.4 171.9 237.9 172.2 C236.9 172.8 235.3 174 234.2 174.4 C233.4 173.8 231.4 172 230.7 171.7 C229.4 172.3 226.9 174.3 225.3 175 C225.2 176.3 225.3 177.3 225.1 178.5 C224.6 181.8 219.9 178.2 218.6 177.4 L205.9 169.1 C204.8 168.4 204.9 168.1 203.6 168.8 L188.9 174.2 L188.9 180.2 C189.5 180.7 204.6 186.6 206.6 187.5 C207.5 187.9 207.9 188 208.6 188.6Z"/>
+    <!-- Tentacle 2 -->
+    <path fill="#00ffab" opacity="0.85" d="M51.1 220.4 C50.9 221.2 52.1 224.4 52.4 225.8 L54.2 230.8 L55.3 233.2 L56 234.9 L72.8 257.3 C73 257.5 74.4 259.2 74.7 259.3 C75.7 260 75.8 260.6 76.6 261.3 C77.5 261.9 78.5 262 79.7 261.8 C87.1 260.5 94.4 258.9 101.8 257.5 C103.5 257.1 103.2 257.4 104 255.9 L108.8 245.6 L111.3 240.4 C114.2 233.8 116.4 228.8 119.1 221.9 C119.5 221 119.8 219.9 120.2 219.1 C123 212.3 121.2 210.7 118.5 204.8 C117.8 203.3 115.2 198.5 113.9 198.1 C113.7 198.5 114.3 199.9 114.3 200.7 C114.4 202 113.9 202.2 113.2 202.9 C113 203.9 113.1 205.5 113.1 206.5 L116.3 210.2 C116.4 211.3 116.2 211.6 116.1 211.6 L113 211.8 C113 214.8 113.8 216.8 112.3 216.8 C112.3 217.6 111.9 218.8 111.9 218.8 L110.9 222.6 L111.4 224.8 L112.4 224.8 L101.8 237.6 L93.1 238.8 L93.1 234.7 L89.3 235.2 L87.4 235.5 L86.3 236.7 C86.3 237.3 86.1 239 86 239.3 C85.3 239.6 82.8 239.3 82.1 239.2 C80.9 238.9 80 238.5 79 238 L79 233.4 L73.2 231.1 C72.2 231.7 71.7 232.8 70.7 233.4 C68.6 232.1 66.6 229.5 65.3 227.5 C65.6 226.6 67.1 225.3 67.7 224.4 L64.5 218.7 L61.4 219 C60.9 218.8 61.3 219.1 61.1 218.6 L59.9 211.5 L62.5 210.1 L62.5 202.9 L61.3 202.4 C61.5 202 61.6 201.2 61.8 200.7 C62.2 199.3 63 197.6 63.7 196.3 C65.3 193 70.1 187.1 73 184.7 C77.8 180.7 81.5 179.7 87.1 177.8 C90.9 176.5 93.7 175.8 97.7 177 C98.3 177.2 100.4 177.9 100.8 178.1 L108.6 181 C114.6 183.1 125.1 187.4 131 190.1 C132.6 190.8 134.3 191.6 135.8 192.4 C142 195.5 145.9 196.5 152 193.7 C154.3 192.6 180.9 181.2 182 180.2 L182 174.2 L168.3 168.7 C167.1 168.1 167.1 168.5 166.1 169.2 L153.4 177.5 C146 182.6 147 178.6 146.8 174.9 C145.6 174.5 142.7 172.3 141.4 171.7 C140.7 172 139.5 173.2 138.8 173.7 L137.9 174.4 C137 174.1 134.9 172.6 134.1 172.1 C131.9 170.8 132.8 171.2 132.6 169.2 C132.5 168.7 132.5 168.5 132.4 168 C132 167.7 127.2 165 126.6 164.9 C126.4 164.9 124.7 166.5 123.9 166.8 C122.2 166 119.2 165.1 119 164.3 C118.8 163.5 119.2 163.1 118.6 162.4 C117.9 162.2 112.7 161.3 112.1 161.3 C111.8 162 110.9 163.2 110.5 163.9 C109.7 163.7 108.3 163.1 107.4 162.8 C100.6 160.6 91.3 159.7 83.9 159.8 L76.1 160.1 L63.3 161.6 C60.2 162.2 57.2 163.5 55.2 165.6 C50.9 169.9 49.4 177.7 48.7 183.6 C48.2 187.5 48.2 187.4 48 191.1 C47.8 193.3 47.5 196.9 47.9 199.1 C48 199.9 47.9 200.4 48 201.1 L48.5 206.6 C48.9 209 49.2 211.4 49.6 213.7 C50 216 50.6 218.2 51.1 220.4Z"/>
+    <!-- Tentacle 3 (right lower) -->
+    <path fill="#00ffab" opacity="0.85" d="M189.7 208.5 C189.7 209.1 189.7 208.4 190.8 210 C190.9 210.2 191 210.3 191.2 210.5 L198 218.2 C198.3 218.7 198.3 218.9 198.9 219.1 L213.2 221.9 L216.7 222.6 C219.2 222.9 222 223.7 224.4 224.1 C226.3 224.4 230.2 226.3 231.8 227.6 C232.2 227.9 232.4 228 232.8 228.3 C235.2 230.3 235.4 230.8 237.4 232.8 L238.2 233.8 L238.6 234.2 L241.3 237.9 L242.1 238.9 L243.5 241.1 C244.5 242.8 245 244 245.6 245.2 L246.3 247 C246.5 247.5 246.6 247.9 246.7 248.4 C247.1 249.3 247.7 252 247.7 252.9 C247.7 255 248 255.3 247.7 258 C247.7 258.3 247.7 258.6 247.7 258.9 C247.6 259.4 247.3 261.1 247.3 262.5 L245.9 262.5 L243 267.5 C242.8 267.9 242.9 268 242.6 268.4 C241.8 269.6 242 268.9 242.8 270.3 C243 270.9 243 270.9 243.5 271.2 L240.8 274.8 L239.8 276.1 C239.6 276.5 239.6 276.3 239.8 276.6 C239.6 277 239.7 276.8 239.5 277.1 C238.7 277 237.9 275.9 237.3 275.2 L233.2 277.9 L231.9 278.8 L232.7 282 C232.2 282.3 226.5 284.6 226.1 284.6 C225.5 283.7 225.2 282.2 224.7 281.4 L218.3 281.1 C217.6 282.1 217.1 283.8 216.4 284.9 L210.2 283.3 L210.9 279.6 L206 276.2 L202.7 278.6 L198.4 273.1 L200.9 270.5 C200.9 269.7 199.2 266.2 198.8 265.2 C197.3 265 196 265.1 194.6 264.9 L194.5 258.7 C195.3 258.9 195.4 258.9 196.2 258.9 L198 252.7 C197.4 251.9 196.1 251.3 195.4 250.4 L198.1 245.6 L200.4 246 L202.9 242.7 C203.1 242.4 203.7 241.7 203.8 241.6 C204.5 240.6 203.2 239.3 204.1 238.3 C204.5 237.7 205.5 236.6 205.8 236.1 C204.8 236 203.3 236.3 202.3 236.5 C201.7 236.3 201.2 236.5 200.6 236.8 L199.9 237 C196.5 238.6 194.2 240.7 191.7 243.3 L189 246.7 C188.5 247.5 188.7 248.6 188.7 249.6 L188.7 278.5 C188.8 278.8 189 279.3 189.1 279.7 L192.6 290 L193.9 293.2 C194.1 293.6 194.1 293.4 194.3 293.8 C194.7 294.6 195 295.3 195.4 296.1 L196.5 298.4 C196.8 298.9 196.9 298.8 197.6 299 L213.3 303.7 C213.9 303.8 214.1 304 214.8 303.9 C216 304.1 217.6 304.6 218.9 305.1 C219.9 305.4 222.1 306.3 223.1 305.9 C227.9 303.5 228.9 303 233.2 300.2 C234.2 299.5 235.4 298.7 236.3 298 L240.7 294.4 C241.2 294 241.5 293.6 242 293.2 L244.7 290.7 C245.9 289.8 251.1 284 252.4 282.7 C252.9 282.3 253.3 281.9 253.7 281.4 C254.2 280.9 254.5 280.5 255 280 C256.7 278 258.1 277 259.9 274.4 C261.5 272.2 262.9 271.1 263.9 268 C264.5 266.1 264.1 265.1 263.7 263.5 C261.1 254.7 258.7 248.7 255.4 240.4 C253.9 236.4 249.1 226.6 246.8 222.8 C244.4 219 244.6 219.7 243.5 215.6 C243.2 214.4 243.1 214.8 242.3 214.1 L240.9 213 C240.5 213.2 239.9 213.8 239.5 214.1 L233.8 211.3 C233.8 210.6 234 209.5 233.9 207.6 C233.3 207.3 230.7 206.5 229.7 206.2 C228.1 205.6 227.3 205 226.6 205.6 C226.1 205.9 224.6 207.3 224.1 207.3 L218 205 L218 200.9 C217.6 200.7 212 198.1 211.3 197.9 L208.5 200.6 C206.4 200.3 202.1 196.4 200.7 194.7 C199.4 193.1 198.2 191.4 197 189.5 C196.1 188.1 196.3 187.9 195.5 187.7 C194.3 187.2 188.7 185 188.2 185 C188.1 185.8 188.2 195.8 188.2 197.5 C188.2 198.6 187.9 206 188.4 206.7 C188.9 207.4 189.5 207.7 189.7 208.5Z"/>
+    <!-- Tentacle 4 (lower left) -->
+    <path fill="#00ffab" opacity="0.85" d="M127.9 217.4 C127.5 217.8 127.6 217.6 127.4 218.2 C127.1 219.1 125.9 221 125.3 222 L123.2 225.7 L122.4 227.2 L113.9 246 L110.5 255.4 L109.8 257.8 L108.1 263.1 C107.7 264 107.4 265.1 107.5 266.2 C107.5 266.7 107.5 267 107.6 267.3 C107.7 267.8 107.7 267.9 107.8 268.4 C108.6 270.8 109.5 271.3 110.3 272.7 C110.8 273.5 110.6 273.1 110.8 273.4 C111 273.7 111.1 273.8 111.3 274.1 L114 277.3 L115.1 278.6 C117.9 281.4 120.4 284.2 123.2 287 L124.9 288.8 C125.4 289.6 126.4 290.6 127.2 291.2 L128.3 292.1 C129.7 293.5 131.1 294.6 132.5 295.9 L134.2 297.2 C134.7 297.6 135.1 297.9 135.5 298.3 C135.9 298.6 136.4 298.9 136.9 299.3 L144.5 304 C145.3 304.4 146.7 305.4 147.5 305.3 C149.7 306 148.2 306.6 153.3 305 L159.2 303.2 C164 301.8 169.4 300 174 298.8 C175.2 298.5 175 298.7 175.8 296.8 L177.1 294.3 L182.4 280.3 C183.1 277.7 182.8 268.8 182.8 265.5 L182.8 250.1 L181.7 245.6 L180 243.5 C178.1 241.3 175 238.9 172.4 237.6 C170.9 236.8 167.7 235.9 166.1 236.1 C166.3 236.5 167 237.3 167.3 237.6 C167.6 238 168.6 238.9 167.9 239.5 C167.3 241.3 167.8 241.7 168.9 243 L171.2 246 C171.3 246.1 171.4 246.3 171.9 246.2 C172.5 246 172.7 245.8 173.8 245.8 C173.9 246.6 174.1 246.4 174.4 246.9 L176.2 250.4 L173.6 252.3 L174.5 255.7 C174.8 256.6 175.4 258.6 175.4 259.1 L177.2 259.1 L177.2 264.9 C175.6 265 174.6 264.9 173.1 265.2 C172.8 265.7 171 269.9 170.9 270.4 C171.2 271 172.8 272.3 173.4 273.1 L171.3 275.9 L169.1 278.5 C168.3 278.2 167.1 277 166.2 276.5 C165.6 276.1 165.4 276.4 164.1 277.3 L161 279.5 L161.6 282.7 L155.4 285 L153.7 281.1 L147.2 281.4 C146.7 282.1 146.4 284 145.8 284.6 C145.4 284.6 139.5 282.3 139.2 282 C139.4 281 139.8 279.8 140 278.8 C139.4 278.2 135.6 275.9 134.6 275.2 C133.7 275.5 132.9 276.4 132.2 276.6 L128.2 271.2 C128.5 270.6 129 270 129.4 269.4 L126.4 263.8 C125.5 262.2 125.9 263.2 124.6 262.7 C124.1 261.4 123.9 256.5 123.9 254.8 C123.9 246.9 128.4 239.9 133.2 233.9 C135.2 231.5 136.9 229.6 139.8 227.5 C141.6 226.2 143.1 225.3 145.3 224.5 C147.7 223.7 149.9 223.3 152.4 222.8 C157 221.9 162.5 221 166.8 220 C167.9 219.8 169.2 219.5 170.4 219.3 C173.4 218.8 172.9 219.3 175.6 215.9 L179.6 211.2 L183.6 206.6 C183.9 205.9 183.7 186.5 183.7 185 C183.2 185 178 187 177.2 187.4 C175.5 188.1 175.8 188.1 174.9 189.5 C174.2 190.6 173.8 191.1 173 192.3 C171.1 194.9 170.9 194.9 168.8 197.1 C167.9 198 164.8 200.4 163.3 200.5 L160.6 197.9 L153.9 200.9 L153.9 205.1 C152.6 205.5 151.3 206.1 149.9 206.6 C147.2 207.5 148.1 207.7 146.2 206.3 C144.6 205.1 144.9 205.2 142.2 206.1 C140.8 206.6 139.4 207.2 137.9 207.6 L137.4 211.6 C137.1 211.7 136.9 211.8 136.6 211.9 L132.5 214 C131 213.4 131.6 212 128.9 214.7 C128.1 215.5 128.3 216.6 127.9 217.4Z"/>
+    <!-- Robot head center -->
+    <g transform="translate(186, 190)">
+      <circle cx="0" cy="0" r="28" fill="#0a0f0c"/>
+      <rect x="-21" y="-15" width="42" height="28" rx="7" fill="#0a0f0c" stroke="#00ffab" stroke-width="2.5"/>
+      <line x1="0" y1="-15" x2="0" y2="-27" stroke="#00ffab" stroke-width="2.5"/>
+      <circle cx="0" cy="-30" r="3.5" fill="#00ffab"/>
+      <rect x="-14" y="-9" width="9" height="7" rx="2" fill="#00ffab"/>
+      <rect x="5"  y="-9" width="9" height="7" rx="2" fill="#00ffab"/>
+      <rect x="-11" y="-7" width="3" height="3" rx="1" fill="#0a0f0c" opacity="0.5"/>
+      <rect x="8"   y="-7" width="3" height="3" rx="1" fill="#0a0f0c" opacity="0.5"/>
+      <circle cx="-23" cy="-1" r="3.5" fill="#00ffab"/>
+      <circle cx="23"  cy="-1" r="3.5" fill="#00ffab"/>
+    </g>
+  </svg>
+
+    <div class="wordmark">polvo</div>
+    <div class="tagline">AI agent orchestrator for spec-first projects</div>
+    <div class="version-pill" id="welcome-version">v0.1.0</div>
+  </div>
+
+  <div class="wizard-card">
+    <div class="wizard-title">Initialize Project</div>
+    <div class="wizard-subtitle">Quickly set up polvo for this directory</div>
+
+    <div class="form-group">
+      <label class="form-label">Project Name</label>
+      <input type="text" id="wiz-project-name" class="form-input" placeholder="my-awesome-project">
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Select AI Providers</label>
+      <div class="provider-grid">
+        <label class="provider-opt selected" onclick="toggleProvider(this, 'ollama')">
+          <input type="checkbox" checked value="ollama"> Ollama (local)
+        </label>
+        <label class="provider-opt" onclick="toggleProvider(this, 'claude')">
+          <input type="checkbox" value="claude"> Claude
+        </label>
+        <label class="provider-opt" onclick="toggleProvider(this, 'openai')">
+          <input type="checkbox" value="openai"> OpenAI
+        </label>
+        <label class="provider-opt" onclick="toggleProvider(this, 'gemini')">
+          <input type="checkbox" value="gemini"> Gemini
+        </label>
+      </div>
+    </div>
+
+    <div style="margin-top: 10px; display: flex; flex-direction: column; gap: 12px;">
+      <button class="btn" onclick="initProjectFromWizard()">Start Orchestrating</button>
+      <div id="wiz-status" style="font-size: 11px; text-align: center; min-height: 1.5em;"></div>
+    </div>
+
+    <div style="border-top: 1px solid var(--border); padding-top: 16px; display: flex; justify-content: space-between; align-items: center;">
+      <span style="color:var(--dim); font-size: 11px;">Current Dir: <span id="wiz-cwd" style="color:var(--text)">/path/to/project</span></span>
+      <span class="nav-link" style="padding: 2px 0;" onclick="showConfig()">Advanced Editor</span>
+    </div>
+  </div>
+</div>
+
+<!-- Status bar (always visible at bottom) -->
+<div class="status-bar" id="status-bar">
+  <div class="sb-badge" id="sb-watch">
+    <span class="sb-dot"></span>
+    <span>watch (ctrl+w)</span>
+  </div>
+  <div class="sb-badge" id="sb-idle">idle</div>
+  <span style="flex:1"></span>
+  <span style="color:var(--dim);font-size:11px" id="sb-version">polvo dev</span>
+</div>
+
+<!-- ══ DASHBOARD (configured) ══ -->
+<div id="dashboard" style="display:none; flex:1; flex-direction:column; overflow:hidden;">
+
+  <header>
+    <span class="header-logo">&#9711; polvo</span>
+    <span id="badge-watch" class="badge dim">not watching</span>
+    <span id="badge-agent" class="badge green" style="display:none"><span class="spinner"></span>agent running</span>
+    <span class="spacer"></span>
+    <span class="nav-link active" onclick="showDashboard()">dashboard</span>
+    <span class="nav-link" onclick="showConfig()">config</span>
+    <span class="spacer"></span>
+    <span id="project-name" class="project-name"></span>
+  </header>
+
+  <div id="main-view" style="flex:1; display:flex; flex-direction:column; overflow:hidden;">
+    <div class="grid">
+      <div class="panel">
+        <div class="panel-header">agents</div>
+        <div class="panel-body" id="agents-list"><div class="empty">No agents running</div></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">live log</div>
+        <div class="panel-body" id="log"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">reports</div>
+        <div class="panel-body" id="reports-list"><div class="empty">No reports yet</div></div>
+      </div>
+
+      <footer>
+        <span>providers:</span>
+        <span id="providers-row">loading...</span>
+      </footer>
+    </div>
+  </div>
+
+  <!-- ══ CONFIG VIEW ══ -->
+  <div id="config-view" style="display:none">
+    <div class="panel-header">polvo.yaml editor</div>
+    <textarea id="config-editor" class="yaml-editor" spellcheck="false"></textarea>
+    <div class="config-actions">
+      <button class="btn" onclick="saveConfig()">Save Settings</button>
+      <button class="btn btn-dim" onclick="showDashboard()">Cancel</button>
+      <span id="config-status" style="font-size:11px; color:var(--dim)"></span>
+    </div>
+  </div>
+
+</div>
+
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+const state = { agents: {}, watching: false, agentRunning: false, configured: false };
+
+// ── Safe DOM ──────────────────────────────────────────
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = String(text);
+  return e;
+}
+
+// ── Show/hide screens ─────────────────────────────────
+function showWelcome() {
+  $('welcome').style.display = 'flex';
+  $('dashboard').style.display = 'none';
+  $('status-bar').style.display = 'flex';
+}
+
+function showDashboard() {
+  $('welcome').style.display = 'none';
+  $('dashboard').style.display = 'flex';
+  $('main-view').style.display = 'flex';
+  $('config-view').style.display = 'none';
+  $('status-bar').style.display = 'none';
+  document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+  document.querySelectorAll('.nav-link')[0].classList.add('active');
+}
+
+function showConfig() {
+  $('main-view').style.display = 'none';
+  $('config-view').style.display = 'flex';
+  document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+  document.querySelectorAll('.nav-link')[1].classList.add('active');
+  fetchConfig();
+}
+
+async function fetchConfig() {
+  try {
+    const resp = await fetch('/api/config');
+    const data = await resp.json();
+    $('config-editor').value = data.yaml || '';
+  } catch (e) {
+    console.error('Failed to fetch config:', e);
+  }
+}
+
+async function saveConfig() {
+  const yaml = $('config-editor').value;
+  const status = $('config-status');
+  status.textContent = 'Saving...';
+  status.style.color = 'var(--dim)';
+  try {
+    const resp = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ yaml })
+    });
+    if (resp.ok) {
+      status.textContent = '✓ Saved and reloaded';
+      status.style.color = 'var(--green)';
+      setTimeout(() => { status.textContent = ''; }, 3000);
+    } else {
+      const err = await resp.text();
+      status.textContent = '✗ Error: ' + err;
+      status.style.color = 'var(--red)';
+    }
+  } catch (e) {
+    status.textContent = '✗ Error: ' + e.message;
+    status.style.color = 'var(--red)';
+  }
+}
+
+// ── Log ───────────────────────────────────────────────
+function logLine(text, cls) {
+  const log = $('log');
+  const atBottom = log.scrollHeight - log.clientHeight <= log.scrollTop + 4;
+  const d = el('div', 'log-line ' + (cls || ''));
+  d.textContent = (text || '').replace(/\x1b\[[0-9;]*m/g, '');
+  log.appendChild(d);
+  while (log.children.length > 500) log.removeChild(log.firstChild);
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+
+// ── Render helpers ────────────────────────────────────
+function renderAgents() {
+  const list = $('agents-list');
+  list.textContent = '';
+  const items = Object.values(state.agents);
+  if (items.length === 0) { list.appendChild(el('div', 'empty', 'No agents running')); return; }
+  items.forEach(a => {
+    const cls = a.done ? (a.error ? 'done-err' : 'done-ok') : 'running';
+    const card = el('div', 'agent-item ' + cls);
+    card.appendChild(el('div', 'agent-name', a.name));
+    const fe = el('div', 'agent-file', a.file); fe.title = a.file;
+    card.appendChild(fe);
+    const st = el('div', 'agent-status');
+    if (!a.done) {
+      st.appendChild(el('span', 'spinner')); st.appendChild(document.createTextNode('running'));
+    } else if (a.error) {
+      st.className += ' status-err'; st.textContent = '✗ ' + a.error;
+    } else {
+      st.className += ' status-ok'; st.textContent = '✓ done';
+    }
+    card.appendChild(st);
+    list.appendChild(card);
+  });
+}
+
+function renderReports(reports) {
+  const list = $('reports-list');
+  list.textContent = '';
+  if (!reports || reports.length === 0) { list.appendChild(el('div', 'empty', 'No reports yet')); return; }
+  reports.forEach(r => {
+    const dec = (r.decision || '').toLowerCase();
+    const cls = dec === 'approve' ? 'approve' : dec === 'reject' ? 'reject' : 'info';
+    const card = el('div', 'report-item ' + cls);
+    card.appendChild(el('div', 'report-agent', r.agent));
+    const fe = el('div', 'report-file', r.file); fe.title = r.file;
+    card.appendChild(fe);
+    if (r.summary) card.appendChild(el('div', 'report-summary', r.summary));
+    const ts = r.timestamp ? r.timestamp.slice(0,19).replace('T',' ') : '';
+    card.appendChild(el('div', 'report-meta', [r.decision, r.severity, ts].filter(Boolean).join(' · ')));
+    list.appendChild(card);
+  });
+}
+
+function renderProviders(providers) {
+  const row = $('providers-row');
+  row.textContent = '';
+  if (!providers || providers.length === 0) { row.textContent = 'none configured'; return; }
+  providers.forEach((p, i) => {
+    if (i > 0) row.appendChild(document.createTextNode('  '));
+    row.appendChild(el('span', 'dot ' + (p.ok ? 'ok' : 'err')));
+    row.appendChild(document.createTextNode(p.name + ' (' + (p.type || '') + ')'));
+  });
+}
+
+function updateHeader() {
+  const bw = $('badge-watch');
+  bw.textContent = state.watching ? 'watching' : 'not watching';
+  bw.className = 'badge ' + (state.watching ? 'green' : 'dim');
+  $('badge-agent').style.display = state.agentRunning ? '' : 'none';
+}
+
+function toggleProvider(el, id) {
+  const cb = el.querySelector('input');
+  cb.checked = !cb.checked;
+  el.classList.toggle('selected', cb.checked);
+}
+
+async function initProjectFromWizard() {
+  const name = $('wiz-project-name').value || $('wiz-project-name').placeholder;
+  const providers = Array.from(document.querySelectorAll('.provider-opt input:checked')).map(i => i.value);
+  const status = $('wiz-status');
+
+  if (providers.length === 0) {
+    status.textContent = 'Select at least one provider';
+    status.style.color = 'var(--red)';
+    return;
+  }
+
+  status.textContent = 'Initializing...';
+  status.style.color = 'var(--dim)';
+
+  // Build a basic YAML
+  let yaml = `project:\n  name: "${name}"\n\nproviders:\n`;
+  providers.forEach((p, i) => {
+    const key = i === 0 ? 'default' : p;
+    if (p === 'ollama') {
+      yaml += `  ${key}:\n    type: ollama\n    base_url: "http://localhost:11434"\n    default_model: "llama3"\n`;
+    } else if (p === 'claude') {
+      yaml += `  ${key}:\n    type: claude\n    api_key: "\${ANTHROPIC_API_KEY}"\n    default_model: "claude-3-5-sonnet-latest"\n`;
+    } else if (p === 'openai') {
+      yaml += `  ${key}:\n    type: openai\n    api_key: "\${OPENAI_API_KEY}"\n    default_model: "gpt-4o"\n`;
+    } else if (p === 'gemini') {
+      yaml += `  ${key}:\n    type: gemini\n    api_key: "\${GEMINI_API_KEY}"\n    default_model: "gemini-1.5-pro"\n`;
+    }
+  });
+
+  yaml += `\n# interfaces:\n#   web:\n#     patterns: ["**/*.ts", "**/*.tsx"]\n`;
+
+  try {
+    const resp = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ yaml })
+    });
+    if (resp.ok) {
+      status.textContent = '✓ Success! Loading dashboard...';
+      status.style.color = 'var(--green)';
+      setTimeout(() => { location.reload(); }, 1500);
+    } else {
+      const err = await resp.text();
+      status.textContent = '✗ ' + err;
+      status.style.color = 'var(--red)';
+    }
+  } catch (e) {
+    status.textContent = '✗ ' + e.message;
+    status.style.color = 'var(--red)';
+  }
+}
+
+// ── Boot ──────────────────────────────────────────────
+async function loadInitial() {
+  try {
+    const [status, providers, reports] = await Promise.all([
+      fetch('/api/status').then(r => r.json()),
+      fetch('/api/providers').then(r => r.json()),
+      fetch('/api/reports').then(r => r.json()),
+    ]);
+
+    state.configured = !!(status.project);
+    state.watching = !!status.watching;
+    state.agentRunning = !!status.agent_running;
+
+    if (state.configured) {
+      $('project-name').textContent = status.project;
+      showDashboard();
+      updateHeader();
+      renderProviders(providers);
+      renderReports(reports);
+    } else {
+      showWelcome();
+      if (status.cwd) {
+        const parts = status.cwd.split(/[/\\]/);
+        const lastPart = parts[parts.length - 1] || 'my-project';
+        $('wiz-project-name').placeholder = lastPart;
+        $('wiz-cwd').textContent = status.cwd;
+      }
+      if (status.version) {
+        $('welcome-version').textContent = 'v' + status.version;
+        $('sb-version').textContent = 'polvo ' + status.version;
+      }
+    }
+  } catch (e) {
+    // Server not yet responding — show welcome, retry via SSE
+    showWelcome();
+  }
+}
+
+// ── SSE ───────────────────────────────────────────────
+function connectSSE() {
+  const es = new EventSource('/events');
+  es.onmessage = ev => {
+    let evt;
+    try { evt = JSON.parse(ev.data); } catch { return; }
+    handleEvent(evt);
+  };
+  es.onerror = () => {
+    setTimeout(connectSSE, 3000);
+    es.close();
+  };
+}
+
+function handleEvent(evt) {
+  const p = evt.payload || {};
+  switch (evt.kind) {
+    case 'snapshot':
+      if (p.status) {
+        state.configured = !!(p.status.project);
+        state.watching = !!p.status.watching;
+        state.agentRunning = !!p.status.agent_running;
+        if (state.configured) {
+          $('project-name').textContent = p.status.project;
+          showDashboard();
+          updateHeader();
+        } else {
+          showWelcome();
+        }
+      }
+      if (Array.isArray(p.agents)) {
+        p.agents.forEach(a => { state.agents[a.file] = a; });
+        renderAgents();
+      }
+      if (Array.isArray(p.recent_log)) {
+        p.recent_log.forEach(line => logLine(line));
+      }
+      break;
+    case 'watch_started':
+      state.watching = true; updateHeader(); logLine('Watching started', 'log-dim'); break;
+    case 'watch_stopped':
+      state.watching = false; updateHeader(); logLine('Watching stopped', 'log-dim'); break;
+    case 'agent_started':
+      if (!state.configured) { showDashboard(); state.configured = true; }
+      state.agents[p.file] = { name: p.name, file: p.file, done: false };
+      state.agentRunning = true; updateHeader(); renderAgents();
+      logLine('agent ' + p.name + ' started on ' + p.file, 'log-dim');
+      break;
+    case 'agent_done':
+      if (state.agents[p.file]) { state.agents[p.file].done = true; state.agents[p.file].error = p.error || ''; }
+      state.agentRunning = Object.values(state.agents).some(a => !a.done);
+      updateHeader(); renderAgents();
+      if (p.error) logLine('agent ' + p.name + ' failed: ' + p.error, 'log-err');
+      else logLine('agent ' + p.name + ' done', 'log-dim');
+      fetch('/api/reports').then(r => r.json()).then(renderReports).catch(() => {});
+      break;
+    case 'file_changed':
+      logLine('file changed: ' + (p.path || '') + ' (' + (p.op || '') + ')', 'log-dim'); break;
+    case 'pr_created':
+      logLine('PR created: ' + (p.url || ''), ''); break;
+    case 'report_saved':
+      fetch('/api/reports').then(r => r.json()).then(renderReports).catch(() => {}); break;
+    case 'log':
+      if (p.text) {
+        const t = p.text;
+        const cls = (t.includes('ERROR') || t.includes('error')) ? 'log-err'
+                  : t.includes('WARN') ? 'log-warn'
+                  : t.includes('DEBUG') ? 'log-dim' : '';
+        logLine(t, cls);
+      }
+      break;
+  }
+}
+
+loadInitial();
+connectSSE();
+</script>
+</body>
+</html>

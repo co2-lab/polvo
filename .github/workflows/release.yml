@@ -1,0 +1,311 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Generate release notes from conventional commits
+  # -----------------------------------------------------------------------
+  release-notes:
+    name: Generate release notes
+    runs-on: ubuntu-latest
+    outputs:
+      notes: ${{ steps.cliff.outputs.content }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog with git-cliff
+        id: cliff
+        uses: orhun/git-cliff-action@v3
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: RELEASE_NOTES.md
+
+  # -----------------------------------------------------------------------
+  # Build & sign the Tauri app on all three platforms
+  # -----------------------------------------------------------------------
+  build-tauri:
+    name: Build (${{ matrix.platform }})
+    needs: release-notes
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - macos-latest
+          - ubuntu-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add Rust targets (macOS universal)
+        if: matrix.platform == 'macos-latest'
+        run: |
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
+
+      - name: Install system dependencies (Ubuntu)
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install npm dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Build UI
+        working-directory: ui
+        run: npm run build
+
+      - name: Copy UI dist to Go embed
+        shell: bash
+        run: |
+          mkdir -p app/web/dist
+          cp -r ui/dist/* app/web/dist/
+
+      - name: Build Go sidecar (macOS universal)
+        if: matrix.platform == 'macos-latest'
+        working-directory: app
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          GOOS=darwin GOARCH=arm64 go build \
+            -ldflags "-X main.Version=${TAG} -X main.CommitSHA=${SHA} -X main.BuildDate=$(date -u +%Y-%m-%d)" \
+            -o ../desktop/bin/polvo-aarch64-apple-darwin \
+            ./cmd/polvo
+          GOOS=darwin GOARCH=amd64 go build \
+            -ldflags "-X main.Version=${TAG} -X main.CommitSHA=${SHA} -X main.BuildDate=$(date -u +%Y-%m-%d)" \
+            -o ../desktop/bin/polvo-x86_64-apple-darwin \
+            ./cmd/polvo
+
+      - name: Build Go sidecar (Linux)
+        if: matrix.platform == 'ubuntu-latest'
+        working-directory: app
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          GOOS=linux GOARCH=amd64 go build \
+            -ldflags "-X main.Version=${TAG} -X main.CommitSHA=${SHA} -X main.BuildDate=$(date -u +%Y-%m-%d)" \
+            -o ../desktop/bin/polvo-x86_64-unknown-linux-gnu \
+            ./cmd/polvo
+
+      - name: Build Go sidecar (Windows)
+        if: matrix.platform == 'windows-latest'
+        working-directory: app
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          GOOS=windows GOARCH=amd64 go build \
+            -ldflags "-X main.Version=${TAG} -X main.CommitSHA=${SHA} -X main.BuildDate=$(date -u +%Y-%m-%d)" \
+            -o ../desktop/bin/polvo-x86_64-pc-windows-msvc.exe \
+            ./cmd/polvo
+
+      - name: Download release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+
+      - name: Build, sign, and release with tauri-action
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Polvo ${{ github.ref_name }}"
+          releaseBody: "${{ needs.release-notes.outputs.notes }}"
+          releaseDraft: true
+          prerelease: false
+          configPath: desktop/tauri.conf.json
+          args: ${{ matrix.platform == 'macos-latest' && '--target universal-apple-darwin' || '' }}
+
+  # -----------------------------------------------------------------------
+  # Generate the latest.json updater manifest
+  # -----------------------------------------------------------------------
+  generate-update-manifest:
+    name: Generate updater manifest
+    needs: build-tauri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate and upload latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          REPO="co2-lab/polvo"
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          RELEASE_ID=$(gh api "repos/${REPO}/releases/tags/${TAG}" | jq -r '.id')
+
+          get_sig() {
+            gh api "repos/${REPO}/releases/${RELEASE_ID}/assets" \
+              | jq -r --arg p "$1" '.[] | select(.name | test($p)) | .browser_download_url' \
+              | head -1 | xargs -I{} curl -fsSL {}
+          }
+          get_url() {
+            gh api "repos/${REPO}/releases/${RELEASE_ID}/assets" \
+              | jq -r --arg p "$1" '.[] | select(.name | test($p)) | .browser_download_url' \
+              | head -1
+          }
+
+          cat > latest.json <<JSON
+          {
+            "version": "${TAG}",
+            "notes": "See the release page for details.",
+            "pub_date": "${PUB_DATE}",
+            "platforms": {
+              "darwin-universal": { "url": "$(get_url '.*universal.*\.dmg$')",   "signature": "$(get_sig '.*universal.*\.dmg\.sig$')" },
+              "linux-x86_64":     { "url": "$(get_url '.*x86_64.*\.AppImage$')", "signature": "$(get_sig '.*x86_64.*\.AppImage\.sig$')" },
+              "windows-x86_64":   { "url": "$(get_url '.*x64.*\.msi$')",         "signature": "$(get_sig '.*x64.*\.msi\.sig$')" }
+            }
+          }
+          JSON
+
+          gh release upload "${TAG}" latest.json --repo "${REPO}" --clobber
+
+  # -----------------------------------------------------------------------
+  # Update CHANGELOG.md on main after release
+  # -----------------------------------------------------------------------
+  update-changelog:
+    name: Update CHANGELOG.md
+    needs: build-tauri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update CHANGELOG with git-cliff
+        uses: orhun/git-cliff-action@v3
+        with:
+          config: cliff.toml
+          args: --output CHANGELOG.md
+
+      - name: Commit CHANGELOG
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "chore: update CHANGELOG for ${TAG}" || exit 0
+          git push origin HEAD:main
+
+  # -----------------------------------------------------------------------
+  # Publish to Homebrew tap (macOS)
+  # -----------------------------------------------------------------------
+  publish-homebrew:
+    name: Publish to Homebrew
+    needs: build-tauri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update Homebrew tap
+        env:
+          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          REPO="co2-lab/polvo"
+          VERSION="${TAG#v}"
+
+          DMG_URL=$(gh api "repos/${REPO}/releases/tags/${TAG}" \
+            | jq -r '.assets[] | select(.name | test("universal.*\\.dmg$")) | .browser_download_url' \
+            | head -1)
+
+          SHA256=$(curl -fsSL "${DMG_URL}" | sha256sum | awk '{print $1}')
+
+          EXISTING_SHA=$(gh api repos/co2-lab/homebrew-tap/contents/Casks/polvo.rb \
+            | jq -r '.sha // empty' 2>/dev/null || echo "")
+
+          CASK_CONTENT=$(cat <<CASK
+          cask "polvo" do
+            version "${VERSION}"
+            sha256 "${SHA256}"
+
+            url "${DMG_URL}"
+            name "Polvo"
+            desc "AI agent orchestrator for spec-first projects"
+            homepage "https://github.com/co2-lab/polvo"
+
+            app "Polvo.app"
+
+            zap trash: [
+              "~/.config/polvo",
+              "~/Library/Application Support/io.co2lab.polvo",
+            ]
+          end
+          CASK
+          )
+
+          gh api \
+            --method PUT \
+            -H "Accept: application/vnd.github+json" \
+            "repos/co2-lab/homebrew-tap/contents/Casks/polvo.rb" \
+            -f message="Update polvo to ${TAG}" \
+            -f content="$(echo "${CASK_CONTENT}" | base64 -w0)" \
+            ${EXISTING_SHA:+-f sha="${EXISTING_SHA}"}
+
+  # -----------------------------------------------------------------------
+  # Publish to winget (Windows)
+  # -----------------------------------------------------------------------
+  publish-winget:
+    name: Publish to winget
+    needs: build-tauri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Submit to winget
+        uses: vedantmgoyal9/winget-releaser@latest
+        with:
+          identifier: co2-lab.Polvo
+          token: ${{ secrets.WINGET_TOKEN }}
+          release-tag: ${{ github.ref_name }}

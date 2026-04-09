@@ -1,0 +1,43 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+
+# AI assistant local settings
+.claude/
+.cursor/
+.copilot/
+.aider*
+.continue/
+.codeium/
+.gemini/
+.windsurf/
+GEMINI.md
+AGENTS.md
+CLAUDE.md
+
+# Go binaries
+polvo
+server
+bin/
+app/bin/
+app/polvo-ide
+desktop/bin/
+
+# Rust build artifacts
+desktop/target/
+
+# Node
+node_modules/
+ui/node_modules/
+ui/dist/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

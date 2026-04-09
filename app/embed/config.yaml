@@ -1,0 +1,55 @@
+# Polvo base configuration
+# This is the default configuration embedded in the binary.
+# Project-level polvo.yaml extends/overrides these defaults.
+
+chain:
+  steps:
+    - trigger: "*.spec.md"
+      agent: spec
+      role: author
+      next: interface
+    - trigger: "interface_generated"
+      agent: review
+      role: reviewer
+      gates: [lint, best-practices]
+    - trigger: "interface_merged"
+      agent: features
+      role: author
+    - trigger: "features_generated"
+      agent: review
+      role: reviewer
+      gates: [lint, best-practices]
+    - trigger: "features_merged"
+      agent: tests
+      role: author
+    - trigger: "tests_generated"
+      agent: review
+      role: reviewer
+      gates: [lint, best-practices]
+    - trigger: "tests_merged"
+      agent: docs
+      role: author
+    - trigger: "docs_generated"
+      agent: review
+      role: reviewer
+      gates: []
+
+  inverse:
+    - trigger: "interface_changed"
+      agents: [spec, lint, best-practices]
+
+review:
+  gates: [lint, best-practices]
+  max_retries: 3
+  auto_merge: true
+
+git:
+  branch_prefix: "polvo/"
+  pr_labels: ["polvo", "automated"]
+  target_branch: "main"
+
+settings:
+  debounce_ms: 500
+  report_dir: ".polvo/reports"
+  log_level: "info"
+  max_parallel: 2
