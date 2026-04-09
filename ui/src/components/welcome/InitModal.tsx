@@ -74,15 +74,6 @@ const PROVIDER_NEEDS_URL: Record<string, boolean> = {
 
 const BUILTIN_GUIDES = ['spec', 'features', 'tests', 'review', 'lint', 'best-practices', 'docs']
 
-const GUIDE_DESC: Record<string, string> = {
-  spec:             'Generates specification documents from interfaces',
-  features:         'Breaks specs into implementable feature stories',
-  tests:            'Writes test cases from feature stories',
-  review:           'Reviews generated code for quality',
-  lint:             'Checks code style and formatting',
-  'best-practices': 'Enforces architectural best practices',
-  docs:             'Generates documentation',
-}
 
 function emptyGuide(name: string): GuideConfig {
   return { name, base: '', mode: '', file: '', provider: '', model: '', prompt: '', role: '', useTools: false }
@@ -173,12 +164,12 @@ function groupModels(models: string[], providerType: string): SelectItems {
   const hasGroups = Object.keys(families).length > 0
   if (!hasGroups) return models.map(m => ({ value: m, label: m }))
 
-  const result: SelectItems = []
+  const result: (SelectOption | SelectGroup)[] = []
   for (const [group, opts] of Object.entries(families)) {
-    result.push({ group, options: opts.map(m => ({ value: m, label: m })) })
+    result.push({ group, options: opts.map(m => ({ value: m, label: m })) } as SelectGroup)
   }
   if (ungrouped.length > 0) {
-    result.push({ group: 'Other', options: ungrouped.map(m => ({ value: m, label: m })) })
+    result.push({ group: 'Other', options: ungrouped.map(m => ({ value: m, label: m })) } as SelectGroup)
   }
   return result
 }
@@ -312,7 +303,7 @@ export function InitModal({ open, onClose, onSuccess, colors, cwd }: InitModalPr
     providers.forEach((p, i) => {
       const needsKey = PROVIDER_NEEDS_KEY[p.type]
       const needsUrl = PROVIDER_NEEDS_URL[p.type]
-      const canFetch = (!needsKey || p.apiKey) && (!needsUrl || p.baseURL)
+      const canFetch = (!needsKey || p.apiKeyValue) && (!needsUrl || p.baseURL)
       if (canFetch) fetchModels(i, p)
     })
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -404,12 +395,12 @@ export function InitModal({ open, onClose, onSuccess, colors, cwd }: InitModalPr
       ? `— use default (${defaultModel}) —`
       : '— use default —'
 
-    const result: SelectItems = [{ value: '', label: defaultLabel }]
+    const result: (SelectOption | SelectGroup)[] = [{ value: '', label: defaultLabel }]
     providers.forEach((p, i) => {
       const models = providerModels[i]
       if (!models || models.length === 0) return
       const providerName = p.name.trim() || `Provider ${i + 1}`
-      result.push({ group: providerName, options: models.map(m => ({ value: m, label: m })) })
+      result.push({ group: providerName, options: models.map(m => ({ value: m, label: m })) } as SelectGroup)
     })
     return result
   }

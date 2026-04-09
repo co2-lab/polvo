@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Loader, AlertCircle } from 'lucide-react'
 import { EditorPane } from '../editor/EditorPane'
 import { SaveAsModal } from '../editor/SaveAsModal'

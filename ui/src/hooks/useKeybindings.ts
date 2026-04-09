@@ -1,5 +1,5 @@
 import { useEffect, useCallback } from 'react'
-import { useIDEDispatch } from '../store/IDEContext'
+import { useIDEStore } from '../store/useIDEStore'
 
 export interface Keybinding {
   id: string
@@ -49,7 +49,7 @@ export function saveKeybinding(id: string, key: string): void {
 }
 
 export function useKeybindings() {
-  const dispatch = useIDEDispatch()
+  const addWorkspace = useIDEStore((s) => s.addWorkspace)
 
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
     const keybindings = loadKeybindings()
@@ -64,7 +64,7 @@ export function useKeybindings() {
           case 'new-workspace':
             if (e.ctrlKey && e.shiftKey && e.key === 'N') {
               e.preventDefault()
-              dispatch({ type: 'ADD_WORKSPACE' })
+              addWorkspace()
             }
             break
           default:
@@ -72,7 +72,7 @@ export function useKeybindings() {
         }
       }
     }
-  }, [dispatch])
+  }, [addWorkspace])
 
   useEffect(() => {
     document.addEventListener('keydown', handleKeyDown)

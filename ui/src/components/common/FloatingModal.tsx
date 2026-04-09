@@ -18,15 +18,6 @@ export interface TitleBarProps {
 
 type ResizeDir = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw'
 
-function getCursor(dir: ResizeDir): string {
-  switch (dir) {
-    case 'n': case 's': return 'ns-resize'
-    case 'e': case 'w': return 'ew-resize'
-    case 'ne': case 'sw': return 'nesw-resize'
-    case 'nw': case 'se': return 'nwse-resize'
-  }
-}
-
 // Edge handles: each is an absolutely-positioned div covering a border edge.
 // HIT is the clickable thickness (large for easy grab).
 // The visual border is 1px via the parent's border — these handles are transparent.
