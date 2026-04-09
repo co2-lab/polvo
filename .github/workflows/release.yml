@@ -22,7 +22,7 @@ jobs:
 
       - name: Generate changelog with git-cliff
         id: cliff
-        uses: orhun/git-cliff-action@v3
+        uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
           args: --latest --strip header
@@ -226,7 +226,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update CHANGELOG with git-cliff
-        uses: orhun/git-cliff-action@v3
+        uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
           args: --output CHANGELOG.md
