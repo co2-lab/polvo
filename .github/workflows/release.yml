@@ -94,6 +94,10 @@ jobs:
         working-directory: ui
         run: npm ci
 
+      - name: Install desktop npm dependencies
+        working-directory: desktop
+        run: npm ci
+
       - name: Build UI
         working-directory: ui
         run: npm run build
@@ -168,7 +172,7 @@ jobs:
           releaseBody: "${{ needs.release-notes.outputs.notes }}"
           releaseDraft: true
           prerelease: false
-          configPath: desktop/tauri.conf.json
+          projectPath: desktop
           args: ${{ matrix.platform == 'macos-latest' && '--target universal-apple-darwin' || '' }}
 
   # -----------------------------------------------------------------------
