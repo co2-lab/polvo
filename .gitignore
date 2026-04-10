@@ -24,7 +24,7 @@ CLAUDE.md
 /server
 bin/
 app/bin/
-app/polvo-ide
+app/polvo
 desktop/bin/
 
 # Rust build artifacts
