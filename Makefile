@@ -31,7 +31,7 @@ web-dev: kill-server
 build:
 	cd ui && npm run build
 	cd app && make build
-	npm run tauri build -- --config desktop/tauri.conf.json
+	cd desktop && npx tauri build --config tauri.conf.json
 
 ui-dev:
 	cd ui && npm run dev
