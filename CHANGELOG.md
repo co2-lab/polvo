@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.1 — 2026-04-10
+
+### Bug Fixes
+
+- Align sidecar name with externalBin declaration ([#2c9821f](https://github.com/co2-lab/polvo/commit/2c9821f7891652929ff2e1ed550f811ed651970a))
+- Use winget-releaser@v2 instead of @latest ([#bd3d0a0](https://github.com/co2-lab/polvo/commit/bd3d0a003440a587af8942d8cd8b5512c59cbced))
+
 ## v0.1.0 — 2026-04-09
 
 ### Bug Fixes
