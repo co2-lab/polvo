@@ -323,7 +323,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Submit to winget
-        uses: vedantmgoyal9/winget-releaser@latest
+        uses: vedantmgoyal9/winget-releaser@v2
         with:
           identifier: co2-lab.Polvo
           token: ${{ secrets.WINGET_TOKEN }}
