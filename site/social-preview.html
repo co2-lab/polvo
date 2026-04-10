@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    width: 1280px;
+    height: 640px;
+    overflow: hidden;
+    background: #080c0a;
+    font-family: -apple-system, 'SF Pro Display', 'Inter', sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+
+  /* Grid lines */
+  .grid {
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(0,255,171,0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,255,171,0.04) 1px, transparent 1px);
+    background-size: 60px 60px;
+  }
+
+  /* Glow blobs */
+  .blob1 {
+    position: absolute;
+    width: 500px; height: 500px;
+    left: -100px; top: -100px;
+    background: radial-gradient(circle, rgba(0,255,171,0.12) 0%, transparent 70%);
+    pointer-events: none;
+  }
+  .blob2 {
+    position: absolute;
+    width: 400px; height: 400px;
+    right: -80px; bottom: -80px;
+    background: radial-gradient(circle, rgba(123,97,255,0.12) 0%, transparent 70%);
+    pointer-events: none;
+  }
+  .blob3 {
+    position: absolute;
+    width: 300px; height: 300px;
+    right: 300px; top: -50px;
+    background: radial-gradient(circle, rgba(0,196,255,0.08) 0%, transparent 70%);
+    pointer-events: none;
+  }
+
+  .content {
+    position: relative;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 72px;
+    padding: 0 80px;
+  }
+
+  /* Logo */
+  .logo-wrap {
+    flex-shrink: 0;
+    width: 180px;
+    height: 180px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0,255,171,0.05);
+    border: 1px solid rgba(0,255,171,0.15);
+    border-radius: 32px;
+    box-shadow: 0 0 60px rgba(0,255,171,0.1), inset 0 0 40px rgba(0,255,171,0.03);
+  }
+
+  .text-side {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  .org {
+    font-size: 18px;
+    font-weight: 500;
+    color: rgba(255,255,255,0.35);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+
+  .title {
+    font-size: 72px;
+    font-weight: 700;
+    line-height: 1;
+    background: linear-gradient(90deg, #00ffab 0%, #00c4ff 50%, #7b61ff 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    filter: drop-shadow(0 0 30px rgba(0,255,171,0.3));
+  }
+
+  .tagline {
+    font-size: 22px;
+    font-weight: 400;
+    color: rgba(255,255,255,0.55);
+    line-height: 1.4;
+    max-width: 540px;
+  }
+
+  .tagline em {
+    font-style: normal;
+    color: rgba(0,255,171,0.8);
+  }
+
+  .pills {
+    display: flex;
+    gap: 10px;
+    margin-top: 4px;
+    flex-wrap: wrap;
+  }
+
+  .pill {
+    font-size: 13px;
+    font-weight: 500;
+    padding: 5px 14px;
+    border-radius: 100px;
+    border: 1px solid rgba(255,255,255,0.1);
+    color: rgba(255,255,255,0.45);
+    background: rgba(255,255,255,0.04);
+    letter-spacing: 0.04em;
+  }
+
+  /* bottom bar */
+  .bottom {
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, transparent, #00ffab 30%, #00c4ff 60%, #7b61ff, transparent);
+    opacity: 0.6;
+  }
+</style>
+</head>
+<body>
+  <div class="grid"></div>
+  <div class="blob1"></div>
+  <div class="blob2"></div>
+  <div class="blob3"></div>
+
+  <div class="content">
+    <div class="logo-wrap">
+      <svg width="120" height="120" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#00ffab"/>
+            <stop offset="50%" stop-color="#00c4ff"/>
+            <stop offset="100%" stop-color="#7b61ff"/>
+          </linearGradient>
+          <filter id="glow">
+            <feGaussianBlur stdDeviation="2" result="blur"/>
+            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
+        <!-- Octopus body -->
+        <ellipse cx="50" cy="38" rx="22" ry="20" fill="url(#g1)" opacity="0.9" filter="url(#glow)"/>
+        <!-- Eyes -->
+        <circle cx="43" cy="34" r="4" fill="#080c0a"/>
+        <circle cx="57" cy="34" r="4" fill="#080c0a"/>
+        <circle cx="44" cy="33" r="1.5" fill="url(#g1)"/>
+        <circle cx="58" cy="33" r="1.5" fill="url(#g1)"/>
+        <!-- Tentacles -->
+        <path d="M32 52 Q24 62 28 74 Q30 80 26 84" stroke="url(#g1)" stroke-width="3.5" stroke-linecap="round" fill="none" filter="url(#glow)"/>
+        <path d="M38 56 Q34 68 36 78 Q37 84 33 88" stroke="url(#g1)" stroke-width="3.5" stroke-linecap="round" fill="none" filter="url(#glow)"/>
+        <path d="M45 58 Q44 70 46 80 Q47 86 44 90" stroke="url(#g1)" stroke-width="3.5" stroke-linecap="round" fill="none" filter="url(#glow)"/>
+        <path d="M52 58 Q52 70 54 80 Q55 86 53 90" stroke="url(#g1)" stroke-width="3.5" stroke-linecap="round" fill="none" filter="url(#glow)"/>
+        <path d="M59 56 Q62 68 62 78 Q62 84 66 88" stroke="url(#g1)" stroke-width="3.5" stroke-linecap="round" fill="none" filter="url(#glow)"/>
+        <path d="M65 52 Q72 62 70 74 Q69 80 74 84" stroke="url(#g1)" stroke-width="3.5" stroke-linecap="round" fill="none" filter="url(#glow)"/>
+      </svg>
+    </div>
+
+    <div class="text-side">
+      <div class="org">co2-lab</div>
+      <div class="title">polvo</div>
+      <div class="tagline">
+        Desktop editor rethought for working with <em>AI agents</em>.<br>
+        Write specs, run agents, ship faster.
+      </div>
+      <div class="pills">
+        <span class="pill">spec-first</span>
+        <span class="pill">AI agents</span>
+        <span class="pill">Tauri + Go</span>
+        <span class="pill">open source</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="bottom"></div>
+</body>
+</html>

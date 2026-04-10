@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "polvo",
+  "productName": "Polvo",
   "version": "0.1.0",
   "identifier": "io.co2lab.polvo",
   "build": {

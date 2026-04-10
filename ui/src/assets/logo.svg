@@ -2,7 +2,7 @@
   <defs>
     <mask id="head-cutout" maskUnits="userSpaceOnUse">
       <rect width="200" height="140" fill="white" />
-      <ellipse cx="100" cy="61" rx="30" ry="20" fill="black" />
+      <rect x="77" y="45" width="46" height="32" rx="9" ry="9" fill="black" />
     </mask>
     <linearGradient id="tentacle-grad" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#00ffab" />
@@ -55,12 +55,13 @@
 
   <!-- Robot head -->
   <g transform="translate(100, 62)">
-    <!-- Head shell — no background needed, tentacles masked out behind it -->
-    <rect x="-20" y="-14" width="40" height="26" rx="7" ry="7" fill="transparent" stroke="url(#head-grad)" stroke-width="3" />
-
     <!-- Antenna -->
-    <line x1="0" y1="-14" x2="0" y2="-26" stroke="url(#head-grad)" stroke-width="2.5" />
+    <rect x="-1.25" y="-26" width="2.5" height="12" fill="url(#head-grad)" />
     <circle cx="0" cy="-28" r="3.5" fill="url(#tentacle-grad)" />
+
+    <!-- Head shell — no background needed, tentacles masked out behind it -->
+    <rect x="-20" y="-14" width="40" height="26" rx="7" ry="7" fill="transparent" stroke="url(#head-grad)"
+      stroke-width="3" />
 
     <!-- Eyes -->
     <rect x="-13" y="-8" width="9" height="7" rx="2" fill="url(#tentacle-grad)" />

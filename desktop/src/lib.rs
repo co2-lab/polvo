@@ -41,12 +41,25 @@ pub fn run() {
       // POLVO_ROOT is read from the environment (set by the Makefile/launcher)
       // and forwarded to the sidecar so it finds polvo.yaml in the correct
       // project directory instead of defaulting to the Tauri resource dir.
-      let polvo_root = std::env::var("POLVO_ROOT").unwrap_or_else(|_| {
-        std::env::current_dir()
-          .unwrap_or_default()
-          .to_string_lossy()
-          .to_string()
-      });
+      // Priority: CLI arg > POLVO_ROOT env > current dir
+      // e.g. `polvo /path/to/project` or `polvo .`
+      let polvo_root = std::env::args()
+        .nth(1)
+        .and_then(|arg| {
+          let path = std::path::Path::new(&arg);
+          if path.is_dir() {
+            path.canonicalize().ok().map(|p| p.to_string_lossy().to_string())
+          } else {
+            None
+          }
+        })
+        .or_else(|| std::env::var("POLVO_ROOT").ok())
+        .unwrap_or_else(|| {
+          std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+        });
 
       match app.shell().sidecar("polvo") {
         Ok(sidecar_command) => {
