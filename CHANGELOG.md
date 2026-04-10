@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.3 — 2026-04-10
+
+### Bug Fixes
+
+- Publish release directly and fix CHANGELOG push conflict ([#9a970b6](https://github.com/co2-lab/polvo/commit/9a970b6740e5f0aab50b5ef273300aacf2ea2695))
+- Fix tauri build command in Makefile ([#9fb8289](https://github.com/co2-lab/polvo/commit/9fb828906dcaa7c6a0868f14f82e4e397132a346))
+
+## v0.1.2 — 2026-04-10
+
+### Features
+
+- Update app icon, product name, and CLI support ([#d562eae](https://github.com/co2-lab/polvo/commit/d562eae36b1f98bdd9039ee9ec7ce3c79f98edef))
+
 ## v0.1.1 — 2026-04-10
 
 ### Bug Fixes
