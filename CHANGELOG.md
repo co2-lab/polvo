@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.0 — 2026-04-14
+
+### Features
+
+- Interactive TUI agent with rich permission model and splash screen ([#8d75c8b](https://github.com/co2-lab/polvo/commit/8d75c8b29f00d17160f606b357888668ac88a7e9))
+
 ## v0.1.3 — 2026-04-10
 
 ### Bug Fixes
