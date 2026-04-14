@@ -3,7 +3,7 @@ module github.com/co2-lab/polvo
 go 1.25.3
 
 require (
-	github.com/anthropics/anthropic-sdk-go v1.26.0
+	github.com/anthropics/anthropic-sdk-go v1.35.1
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/bradleyfalzon/ghinstallation/v2 v2.17.0
 	github.com/cbrgm/githubevents v1.23.1
@@ -30,7 +30,7 @@ require (
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
-	github.com/buger/jsonparser v1.1.1 // indirect
+	github.com/buger/jsonparser v1.1.2 // indirect
 	github.com/charmbracelet/colorprofile v0.4.1 // indirect
 	github.com/charmbracelet/x/ansi v0.11.6 // indirect
 	github.com/charmbracelet/x/cellbuf v0.0.15 // indirect
