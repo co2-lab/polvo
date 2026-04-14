@@ -876,10 +876,27 @@ export const useIDEStore = create<IDEState>()(
     }),
     {
       name: 'polvo',
-      version: 8,
+      version: 9,
       storage: createJSONStorage(() => localStorage),
       migrate: (persisted: unknown, version: number) => {
         const state = persisted as Record<string, unknown>
+        if (version < 9) {
+          // Ensure cli-polvo appears before diff in dock items
+          const dockItems = Array.isArray(state.dockItems)
+            ? (state.dockItems as Array<Record<string, unknown>>)
+            : []
+          const withoutPolvo = dockItems.filter(i => i.id !== 'cli-polvo')
+          const diffIdx = withoutPolvo.findIndex(i => i.id === 'diff')
+          const polvoItem = dockItems.find(i => i.id === 'cli-polvo') ?? {
+            id: 'cli-polvo', name: 'Polvo', icon: 'ai:polvo', type: 'ai', command: 'polvo',
+          }
+          if (diffIdx !== -1) {
+            withoutPolvo.splice(diffIdx, 0, polvoItem)
+          } else {
+            withoutPolvo.push(polvoItem)
+          }
+          return { ...state, dockItems: withoutPolvo }
+        }
         if (version < 8) {
           // Remove agents, chat, log from dock items
           const removedIds = new Set(['agents', 'chat', 'log'])
@@ -955,7 +972,24 @@ export const useIDEStore = create<IDEState>()(
         const existingIds = new Set(state.dockItems.map(i => i.id))
         const missing = initialDockItems.filter(i => !existingIds.has(i.id))
         if (missing.length > 0) {
-          state.dockItems = [...state.dockItems, ...missing]
+          // Merge missing items in their initialDockItems order relative to existing items.
+          // For each missing item, insert it before the first existing item that comes
+          // after it in initialDockItems, so the final order matches the intended default order.
+          const merged = [...state.dockItems]
+          for (const item of missing) {
+            const defaultIdx = initialDockItems.findIndex(d => d.id === item.id)
+            // Find the first item in merged that has a higher index in initialDockItems
+            const insertBefore = merged.findIndex(m => {
+              const mIdx = initialDockItems.findIndex(d => d.id === m.id)
+              return mIdx > defaultIdx
+            })
+            if (insertBefore === -1) {
+              merged.push(item)
+            } else {
+              merged.splice(insertBefore, 0, item)
+            }
+          }
+          state.dockItems = merged
         }
       },
       // Only persist layout-related state; transient UI state is excluded.

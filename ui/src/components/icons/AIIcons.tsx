@@ -85,7 +85,7 @@ export function ContinueIcon({ size = 20, ...props }: IconProps) {
 // Polvo — logo oficial (polvo robô), centralizado em viewBox quadrado
 export function PolvoIcon({ size = 20, ...props }: IconProps) {
   return (
-    <svg viewBox="0 -30 200 200" width={size} height={size} xmlns="http://www.w3.org/2000/svg" {...props}>
+    <svg viewBox="5 -23 190 190" width={size} height={size} xmlns="http://www.w3.org/2000/svg" {...props}>
       <defs>
         <mask id="pvi-cut" maskUnits="userSpaceOnUse">
           <rect x="0" y="-30" width="200" height="200" fill="white" />
