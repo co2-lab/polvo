@@ -159,6 +159,7 @@ const initialDockItems: DockItem[] = [
   { id: 'explorer', name: 'Explorer', icon: 'FolderTree', type: 'tool' },
   { id: 'editor', name: 'Editor', icon: 'FileCode', type: 'tool' },
   { id: 'terminal', name: 'Terminal', icon: 'Terminal', type: 'tool' },
+  { id: 'cli-polvo', name: 'Polvo', icon: 'ai:polvo', type: 'ai', command: 'polvo' },
   { id: 'diff', name: 'Diff', icon: 'GitCompare', type: 'tool' },
 ]
 
@@ -945,6 +946,17 @@ export const useIDEStore = create<IDEState>()(
           return { ...state, diffSessions: sessions, activeDiffSessionId: null }
         }
         return state
+      },
+      // After rehydration, ensure all default dock items are present.
+      // This makes new default items appear even for existing users without
+      // requiring a version bump + migration every time.
+      onRehydrateStorage: () => (state) => {
+        if (!state) return
+        const existingIds = new Set(state.dockItems.map(i => i.id))
+        const missing = initialDockItems.filter(i => !existingIds.has(i.id))
+        if (missing.length > 0) {
+          state.dockItems = [...state.dockItems, ...missing]
+        }
       },
       // Only persist layout-related state; transient UI state is excluded.
       // projects and activeProjectId are NOT persisted — they come from the backend.
