@@ -19,5 +19,13 @@ func DefaultConfig() *Config {
 			LogLevel:    "info",
 			MaxParallel: 2,
 		},
+		Hooks: HooksConfig{
+			PreCommit: PreCommitHookConfig{
+				Enabled:        true,
+				CheckPolvoYAML: true,
+				SecretsScan:    true,
+				AIScan:         false, // opt-in: slower, requires provider
+			},
+		},
 	}
 }

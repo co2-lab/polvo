@@ -16,9 +16,16 @@ type globInput struct {
 
 type globTool struct {
 	workdir string
+	cache   *ToolCache
 }
 
-func NewGlob(workdir string) Tool { return &globTool{workdir: workdir} }
+// NewGlob creates a glob tool without caching.
+func NewGlob(workdir string) Tool { return NewGlobWithCache(workdir, nil) }
+
+// NewGlobWithCache creates a glob tool with an optional result cache.
+func NewGlobWithCache(workdir string, cache *ToolCache) Tool {
+	return &globTool{workdir: workdir, cache: cache}
+}
 
 func (t *globTool) Name() string { return "glob" }
 
@@ -41,6 +48,14 @@ func (t *globTool) Execute(_ context.Context, input json.RawMessage) (*Result, e
 	var in globInput
 	if err := json.Unmarshal(input, &in); err != nil {
 		return ErrorResult(fmt.Sprintf("invalid input: %v", err)), nil
+	}
+
+	// Check cache before walking the filesystem.
+	if t.cache != nil {
+		key := CacheKey(t.Name(), input, "")
+		if cached, ok := t.cache.Get(key); ok {
+			return cached, nil
+		}
 	}
 
 	searchDir := t.workdir
@@ -89,11 +104,17 @@ func (t *globTool) Execute(_ context.Context, input json.RawMessage) (*Result, e
 		return ErrorResult(fmt.Sprintf("walking directory: %v", err)), nil
 	}
 
+	var res *Result
 	if len(matches) == 0 {
-		return &Result{Content: "No matches found"}, nil
+		res = &Result{Content: "No matches found"}
+	} else {
+		res = &Result{Content: strings.Join(matches, "\n")}
 	}
-
-	return &Result{Content: strings.Join(matches, "\n")}, nil
+	if t.cache != nil {
+		key := CacheKey(t.Name(), input, "")
+		t.cache.Set(key, "", res)
+	}
+	return res, nil
 }
 
 // matchDoublestar handles simple ** patterns.

@@ -12,13 +12,14 @@ import (
 // ToolLLMAgent is an agent that uses the agentic loop with read-only tools
 // to explore the codebase before generating content.
 type ToolLLMAgent struct {
-	name         string
-	role         Role
-	guide        string
-	promptTmpl   string
-	providerInst provider.ChatProvider
-	model        string
-	tools        *tool.Registry
+	name            string
+	role            Role
+	guide           string
+	promptTmpl      string
+	providerInst    provider.ChatProvider
+	model           string
+	tools           *tool.Registry
+	architectEditor ArchitectEditorConfig
 }
 
 // NewToolLLMAgent creates an agent that uses tools during execution.
@@ -32,6 +33,12 @@ func NewToolLLMAgent(name string, role Role, guide, promptTmpl string, p provide
 		model:        model,
 		tools:        tools,
 	}
+}
+
+// WithArchitectEditor configures the two-phase architect/editor loop for this agent.
+func (a *ToolLLMAgent) WithArchitectEditor(cfg ArchitectEditorConfig) *ToolLLMAgent {
+	a.architectEditor = cfg
+	return a
 }
 
 func (a *ToolLLMAgent) Name() string { return a.name }
@@ -59,22 +66,31 @@ func (a *ToolLLMAgent) Execute(ctx context.Context, input *Input) (*Result, erro
 		return nil, fmt.Errorf("rendering prompt for agent %s: %w", a.name, err)
 	}
 
-	// Use read-only tools for exploration
-	readOnlyReg := tool.NewRegistry()
-	for _, t := range a.tools.All() {
-		switch t.Name() {
-		case "read", "glob", "grep", "ls":
-			readOnlyReg.Register(t)
+	// When architect/editor is enabled use the full tool registry (the two-phase
+	// loop itself restricts the architect to read-only tools internally).
+	// Otherwise fall back to the classic read-only exploration registry.
+	var loopTools *tool.Registry
+	if a.architectEditor.Enabled {
+		loopTools = a.tools
+	} else {
+		readOnlyReg := tool.NewRegistry()
+		for _, t := range a.tools.All() {
+			switch t.Name() {
+			case "read", "glob", "grep", "ls":
+				readOnlyReg.Register(t)
+			}
 		}
+		loopTools = readOnlyReg
 	}
 
 	loop := NewLoop(LoopConfig{
-		Provider:  a.providerInst,
-		Tools:     readOnlyReg,
-		System:    "You are the " + a.name + " agent for Polvo, an AI agent orchestrator.",
-		Model:     a.model,
-		MaxTurns:  20,
-		MaxTokens: 8192,
+		Provider:        a.providerInst,
+		Tools:           loopTools,
+		System:          "You are the " + a.name + " agent for Polvo, an AI agent orchestrator.",
+		Model:           a.model,
+		MaxTurns:        20,
+		MaxTokens:       8192,
+		ArchitectEditor: a.architectEditor,
 	})
 
 	result, err := loop.Run(ctx, prompt)

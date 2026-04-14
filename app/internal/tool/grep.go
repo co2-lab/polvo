@@ -19,9 +19,16 @@ type grepInput struct {
 
 type grepTool struct {
 	workdir string
+	cache   *ToolCache
 }
 
-func NewGrep(workdir string) Tool { return &grepTool{workdir: workdir} }
+// NewGrep creates a grep tool without caching.
+func NewGrep(workdir string) Tool { return NewGrepWithCache(workdir, nil) }
+
+// NewGrepWithCache creates a grep tool with an optional result cache.
+func NewGrepWithCache(workdir string, cache *ToolCache) Tool {
+	return &grepTool{workdir: workdir, cache: cache}
+}
 
 func (t *grepTool) Name() string { return "grep" }
 
@@ -45,6 +52,14 @@ func (t *grepTool) Execute(_ context.Context, input json.RawMessage) (*Result, e
 	var in grepInput
 	if err := json.Unmarshal(input, &in); err != nil {
 		return ErrorResult(fmt.Sprintf("invalid input: %v", err)), nil
+	}
+
+	// Check cache before searching the filesystem.
+	if t.cache != nil {
+		key := CacheKey(t.Name(), input, "")
+		if cached, ok := t.cache.Get(key); ok {
+			return cached, nil
+		}
 	}
 
 	re, err := regexp.Compile(in.Pattern)
@@ -97,16 +112,21 @@ func (t *grepTool) Execute(_ context.Context, input json.RawMessage) (*Result, e
 		})
 	}
 
+	var res *Result
 	if len(results) == 0 {
-		return &Result{Content: "No matches found"}, nil
+		res = &Result{Content: "No matches found"}
+	} else {
+		if len(results) > maxResults {
+			results = results[:maxResults]
+			results = append(results, fmt.Sprintf("... (truncated at %d results)", maxResults))
+		}
+		res = &Result{Content: strings.Join(results, "\n")}
 	}
-
-	if len(results) > maxResults {
-		results = results[:maxResults]
-		results = append(results, fmt.Sprintf("... (truncated at %d results)", maxResults))
+	if t.cache != nil {
+		key := CacheKey(t.Name(), input, "")
+		t.cache.Set(key, "", res)
 	}
-
-	return &Result{Content: strings.Join(results, "\n")}, nil
+	return res, nil
 }
 
 func searchFile(path string, re *regexp.Regexp, workdir string) []string {

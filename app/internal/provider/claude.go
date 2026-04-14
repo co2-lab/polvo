@@ -60,12 +60,21 @@ func (p *ClaudeProvider) Complete(ctx context.Context, req Request) (*Response, 
 	}
 
 	if req.System != "" {
-		params.System = []anthropic.TextBlockParam{
+		systemBlocks := []anthropic.TextBlockParam{
 			{Text: req.System, Type: "text"},
 		}
+		if IsCacheableModel(model) {
+			systemBlocks = applySystemCacheControl(systemBlocks)
+		}
+		params.System = systemBlocks
 	}
 
-	msg, err := p.client.Messages.New(ctx, params)
+	var callOpts []option.RequestOption
+	if IsCacheableModel(model) {
+		callOpts = append(callOpts, withCacheControlOpts(model)...)
+	}
+
+	msg, err := p.client.Messages.New(ctx, params, callOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("claude completion: %w", err)
 	}
@@ -83,6 +92,8 @@ func (p *ClaudeProvider) Complete(ctx context.Context, req Request) (*Response, 
 			PromptTokens:     int(msg.Usage.InputTokens),
 			CompletionTokens: int(msg.Usage.OutputTokens),
 			TotalTokens:      int(msg.Usage.InputTokens + msg.Usage.OutputTokens),
+			CacheReadTokens:  int(msg.Usage.CacheReadInputTokens),
+			CacheWriteTokens: int(msg.Usage.CacheCreationInputTokens),
 		},
 	}, nil
 }
@@ -112,16 +123,25 @@ func (p *ClaudeProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 	}
 
 	if req.System != "" {
-		params.System = []anthropic.TextBlockParam{
+		systemBlocks := []anthropic.TextBlockParam{
 			{Text: req.System, Type: "text"},
 		}
+		if IsCacheableModel(model) {
+			systemBlocks = applySystemCacheControl(systemBlocks)
+		}
+		params.System = systemBlocks
 	}
 
 	if len(req.Tools) > 0 {
 		params.Tools = convertToolsToClaude(req.Tools)
 	}
 
-	msg, err := p.client.Messages.New(ctx, params)
+	var callOpts []option.RequestOption
+	if IsCacheableModel(model) {
+		callOpts = append(callOpts, withCacheControlOpts(model)...)
+	}
+
+	msg, err := p.client.Messages.New(ctx, params, callOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("claude chat: %w", err)
 	}
@@ -132,6 +152,8 @@ func (p *ClaudeProvider) Chat(ctx context.Context, req ChatRequest) (*ChatRespon
 			PromptTokens:     int(msg.Usage.InputTokens),
 			CompletionTokens: int(msg.Usage.OutputTokens),
 			TotalTokens:      int(msg.Usage.InputTokens + msg.Usage.OutputTokens),
+			CacheReadTokens:  int(msg.Usage.CacheReadInputTokens),
+			CacheWriteTokens: int(msg.Usage.CacheCreationInputTokens),
 		},
 	}
 
@@ -171,16 +193,25 @@ func (p *ClaudeProvider) ChatStream(ctx context.Context, req ChatRequest, handle
 	}
 
 	if req.System != "" {
-		params.System = []anthropic.TextBlockParam{
+		systemBlocks := []anthropic.TextBlockParam{
 			{Text: req.System, Type: "text"},
 		}
+		if IsCacheableModel(model) {
+			systemBlocks = applySystemCacheControl(systemBlocks)
+		}
+		params.System = systemBlocks
 	}
 
 	if len(req.Tools) > 0 {
 		params.Tools = convertToolsToClaude(req.Tools)
 	}
 
-	stream := p.client.Messages.NewStreaming(ctx, params)
+	var streamOpts []option.RequestOption
+	if IsCacheableModel(model) {
+		streamOpts = append(streamOpts, withCacheControlOpts(model)...)
+	}
+
+	stream := p.client.Messages.NewStreaming(ctx, params, streamOpts...)
 	defer stream.Close()
 
 	var msg anthropic.Message
@@ -224,6 +255,8 @@ func (p *ClaudeProvider) ChatStream(ctx context.Context, req ChatRequest, handle
 			PromptTokens:     int(msg.Usage.InputTokens),
 			CompletionTokens: int(msg.Usage.OutputTokens),
 			TotalTokens:      int(msg.Usage.InputTokens + msg.Usage.OutputTokens),
+			CacheReadTokens:  int(msg.Usage.CacheReadInputTokens),
+			CacheWriteTokens: int(msg.Usage.CacheCreationInputTokens),
 		},
 	}
 

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+
+	"github.com/co2-lab/polvo/internal/git"
 )
 
 // Tool is a capability that an LLM can invoke.
@@ -64,16 +66,52 @@ func (r *Registry) All() []Tool {
 	return tools
 }
 
+// RegistryOptions configures optional tools in DefaultRegistry.
+type RegistryOptions struct {
+	BraveAPIKey    string
+	ExtraBlocklist []string
+	Ignore         Ignorer        // optional .polvoignore set
+	SubAgent       SubAgentRunner // optional: enables the delegate tool
+	Explore        ExploreRunner  // optional: enables the explore tool (only at delegate level 0)
+	Cache          *ToolCache     // optional: shared result cache for read, glob, grep, ls
+	BashSession    *BashSession   // optional: persistent bash session; when set the bash tool runs inside it
+	GitClient      git.Client     // optional: enables the diff tool
+		GitPath        string         // optional: git repo path, defaults to workdir
+}
+
 // DefaultRegistry creates a registry with all built-in tools.
-func DefaultRegistry(workdir string) *Registry {
+// Pass opts to enable optional tools (web_search) and extra blocklist entries.
+func DefaultRegistry(workdir string, opts ...RegistryOptions) *Registry {
+	var o RegistryOptions
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+
 	r := NewRegistry()
-	r.Register(NewRead(workdir))
-	r.Register(NewWrite(workdir))
-	r.Register(NewEditTool(workdir))
-	r.Register(NewBash(workdir))
-	r.Register(NewGlob(workdir))
-	r.Register(NewGrep(workdir))
-	r.Register(NewLS(workdir))
+	r.Register(SecretsMaskingMiddleware(NewReadWithCache(workdir, o.Ignore, o.Cache)))
+	r.Register(NewWriteWithCache(workdir, o.Ignore, o.Cache))
+	r.Register(NewEditToolWithCache(workdir, o.Ignore, o.Cache))
+	if o.BashSession != nil {
+		r.Register(NewBashWithSession(workdir, o.ExtraBlocklist, nil, o.BashSession))
+	} else {
+		r.Register(NewBash(workdir, o.ExtraBlocklist...))
+	}
+	r.Register(NewGlobWithCache(workdir, o.Cache))
+	r.Register(NewGrepWithCache(workdir, o.Cache))
+	r.Register(NewLSWithCache(workdir, o.Cache))
+	r.Register(NewThink())
+	r.Register(NewPatchTool(workdir))
+	r.Register(SecretsMaskingMiddleware(NewWebFetch()))
+	r.Register(SecretsMaskingMiddleware(NewWebSearch(o.BraveAPIKey)))
+	if o.SubAgent != nil {
+		r.Register(NewDelegate(o.SubAgent))
+	}
+	if o.Explore != nil {
+		r.Register(NewExploreTool(o.Explore))
+	}
+	if o.GitClient != nil {
+		r.Register(NewDiff(o.GitClient))
+	}
 	return r
 }
 

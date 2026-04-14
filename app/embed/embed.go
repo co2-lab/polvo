@@ -3,5 +3,5 @@ package embed
 
 import "embed"
 
-//go:embed guides prompts config.yaml
+//go:embed guides prompts config.yaml hooks
 var FS embed.FS

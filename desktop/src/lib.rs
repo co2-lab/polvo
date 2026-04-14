@@ -63,7 +63,7 @@ pub fn run() {
 
       match app.shell().sidecar("polvo") {
         Ok(sidecar_command) => {
-          match sidecar_command.env("POLVO_ROOT", &polvo_root).spawn() {
+          match sidecar_command.env("POLVO_ROOT", &polvo_root).env("POLVO_SIDECAR", "1").spawn() {
             Ok(_) => {}
             Err(e) => {
               log::warn!("polvo sidecar could not be spawned (dev mode?): {e}");

@@ -21,3 +21,8 @@ func ReadPrompt(name string) ([]byte, error) {
 func ReadConfig() ([]byte, error) {
 	return fs.ReadFile(polvoEmbed.FS, "config.yaml")
 }
+
+// ReadHook reads an embedded git hook script by name (e.g. "pre-commit").
+func ReadHook(name string) ([]byte, error) {
+	return fs.ReadFile(polvoEmbed.FS, "hooks/"+name)
+}

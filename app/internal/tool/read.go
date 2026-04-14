@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 	"unicode/utf8"
+
+	"github.com/co2-lab/polvo/internal/filelock"
 )
 
 type readInput struct {
@@ -17,9 +20,17 @@ type readInput struct {
 
 type readTool struct {
 	workdir string
+	ignore  Ignorer
+	cache   *ToolCache
 }
 
-func NewRead(workdir string) Tool { return &readTool{workdir: workdir} }
+// NewRead creates a read tool without caching.
+func NewRead(workdir string, ig Ignorer) Tool { return NewReadWithCache(workdir, ig, nil) }
+
+// NewReadWithCache creates a read tool with an optional result cache.
+func NewReadWithCache(workdir string, ig Ignorer, cache *ToolCache) Tool {
+	return &readTool{workdir: workdir, ignore: ig, cache: cache}
+}
 
 func (t *readTool) Name() string { return "read" }
 
@@ -39,16 +50,41 @@ func (t *readTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *readTool) Execute(_ context.Context, input json.RawMessage) (*Result, error) {
+func (t *readTool) Execute(ctx context.Context, input json.RawMessage) (*Result, error) {
 	var in readInput
 	if err := json.Unmarshal(input, &in); err != nil {
 		return ErrorResult(fmt.Sprintf("invalid input: %v", err)), nil
 	}
 
+	// Compute lexical path for ignore check (before symlink resolution).
+	lexPath, err := resolveLexical(t.workdir, in.Path)
+	if err != nil {
+		return ErrorResult(err.Error()), nil
+	}
+	if err := checkIgnored(t.ignore, lexPath); err != nil {
+		return ErrorResult(err.Error()), nil
+	}
 	path, err := resolvePath(t.workdir, in.Path)
 	if err != nil {
 		return ErrorResult(err.Error()), nil
 	}
+
+	// Check cache before acquiring the lock and reading the file.
+	if t.cache != nil {
+		key := CacheKey(t.Name(), input, path)
+		if cached, ok := t.cache.Get(key); ok {
+			return cached, nil
+		}
+	}
+
+	// Acquire shared read lock with a 30-second timeout.
+	lockCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	unlock, err := filelock.Global.LockRead(lockCtx, path)
+	if err != nil {
+		return ErrorResult(fmt.Sprintf("acquiring read lock: %v", err)), nil
+	}
+	defer unlock()
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -85,5 +121,10 @@ func (t *readTool) Execute(_ context.Context, input json.RawMessage) (*Result, e
 		fmt.Fprintf(&sb, "%4d\t%s\n", i+1, lines[i])
 	}
 
-	return &Result{Content: sb.String()}, nil
+	res := &Result{Content: sb.String()}
+	if t.cache != nil {
+		key := CacheKey(t.Name(), input, path)
+		t.cache.Set(key, path, res)
+	}
+	return res, nil
 }

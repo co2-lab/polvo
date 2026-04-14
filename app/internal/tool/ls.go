@@ -15,9 +15,16 @@ type lsInput struct {
 
 type lsTool struct {
 	workdir string
+	cache   *ToolCache
 }
 
-func NewLS(workdir string) Tool { return &lsTool{workdir: workdir} }
+// NewLS creates an ls tool without caching.
+func NewLS(workdir string) Tool { return NewLSWithCache(workdir, nil) }
+
+// NewLSWithCache creates an ls tool with an optional result cache.
+func NewLSWithCache(workdir string, cache *ToolCache) Tool {
+	return &lsTool{workdir: workdir, cache: cache}
+}
 
 func (t *lsTool) Name() string { return "ls" }
 
@@ -38,6 +45,14 @@ func (t *lsTool) Execute(_ context.Context, input json.RawMessage) (*Result, err
 	var in lsInput
 	if err := json.Unmarshal(input, &in); err != nil {
 		return ErrorResult(fmt.Sprintf("invalid input: %v", err)), nil
+	}
+
+	// Check cache before reading the directory.
+	if t.cache != nil {
+		key := CacheKey(t.Name(), input, "")
+		if cached, ok := t.cache.Get(key); ok {
+			return cached, nil
+		}
 	}
 
 	dir := t.workdir
@@ -69,11 +84,17 @@ func (t *lsTool) Execute(_ context.Context, input json.RawMessage) (*Result, err
 		}
 	}
 
+	var res *Result
 	if len(lines) == 0 {
-		return &Result{Content: "(empty directory)"}, nil
+		res = &Result{Content: "(empty directory)"}
+	} else {
+		res = &Result{Content: strings.Join(lines, "\n")}
 	}
-
-	return &Result{Content: strings.Join(lines, "\n")}, nil
+	if t.cache != nil {
+		key := CacheKey(t.Name(), input, "")
+		t.cache.Set(key, "", res)
+	}
+	return res, nil
 }
 
 func formatSize(bytes int64) string {

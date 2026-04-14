@@ -13,36 +13,49 @@ import (
 	ignore "github.com/sabhiram/go-gitignore"
 )
 
-// Event represents a detected file change.
-type Event struct {
-	Path string
-	Op   string // "create", "modify", "delete"
-}
+const maxFileSize = 1 << 20 // 1 MB — skip large files (binary, generated)
 
-// Handler is called when a file change is detected.
-type Handler func(Event)
-
-// Watcher monitors directories for file changes.
+// Watcher monitors a directory for file changes and publishes WatchEvents to a channel.
 type Watcher struct {
+	name      string
 	root      string
-	patterns  []string
-	handler   Handler
-	debouncer *Debouncer
+	includes  []string // patterns without "!" prefix
+	excludes  []string // patterns from "!" prefix (stripped)
+	ch        chan<- WatchEvent
+	debounce  *Debouncer
 	logger    *slog.Logger
 	gitignore *ignore.GitIgnore
 	done      chan struct{}
 }
 
-// New creates a new file watcher.
-func New(root string, patterns []string, debounceMs int, handler Handler, logger *slog.Logger) *Watcher {
-	// Load .gitignore if it exists
+// New creates a Watcher for the named watcher config.
+//
+// patterns supports "!" negation: "!*.gen.go" excludes matching files.
+// Events are published to ch; the caller owns ch and must drain it.
+func New(name, root string, patterns []string, debounceMs int, ch chan<- WatchEvent, logger *slog.Logger) *Watcher {
 	gi, _ := ignore.CompileIgnoreFile(filepath.Join(root, ".gitignore"))
 
+	var includes, excludes []string
+	for _, p := range patterns {
+		if strings.HasPrefix(p, "!") {
+			excludes = append(excludes, strings.TrimPrefix(p, "!"))
+		} else {
+			includes = append(includes, p)
+		}
+	}
+
+	d := debounceMs
+	if d == 0 {
+		d = 300
+	}
+
 	return &Watcher{
+		name:      name,
 		root:      root,
-		patterns:  patterns,
-		handler:   handler,
-		debouncer: NewDebouncer(time.Duration(debounceMs) * time.Millisecond),
+		includes:  includes,
+		excludes:  excludes,
+		ch:        ch,
+		debounce:  NewDebouncer(time.Duration(d) * time.Millisecond),
 		logger:    logger,
 		gitignore: gi,
 		done:      make(chan struct{}),
@@ -57,30 +70,27 @@ func (w *Watcher) Start() error {
 	}
 	defer fsw.Close()
 
-	// Walk directory tree and add all directories
 	_ = filepath.WalkDir(w.root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			// Always skip on error — never abort the walk
 			return filepath.SkipDir
 		}
 		if !d.IsDir() {
 			return nil
 		}
-		name := d.Name()
-		if skipDir(name) {
+		if skipDir(d.Name()) {
 			return filepath.SkipDir
 		}
 		if w.isIgnored(path) {
 			return filepath.SkipDir
 		}
 		if err := fsw.Add(path); err != nil {
-			w.logger.Debug("skip watch dir", "path", path, "error", err)
+			w.logger.Debug("skip watch dir", "watcher", w.name, "path", path, "error", err)
 			return filepath.SkipDir
 		}
 		return nil
 	})
 
-	w.logger.Info("watching for changes", "root", w.root, "patterns", w.patterns)
+	w.logger.Info("watcher started", "name", w.name, "root", w.root, "includes", w.includes, "excludes", w.excludes)
 
 	for {
 		select {
@@ -93,7 +103,7 @@ func (w *Watcher) Start() error {
 			if !ok {
 				return nil
 			}
-			w.logger.Error("watcher error", "error", err)
+			w.logger.Error("watcher error", "name", w.name, "error", err)
 		case <-w.done:
 			return nil
 		}
@@ -109,26 +119,61 @@ func (w *Watcher) handleFSEvent(event fsnotify.Event) {
 	if w.isIgnored(event.Name) {
 		return
 	}
-	if !w.matchesPattern(event.Name) {
+	if !w.matches(event.Name) {
+		return
+	}
+	if tooBig(event.Name) {
 		return
 	}
 
-	var op string
+	var op Op
 	switch {
 	case event.Op.Has(fsnotify.Create):
-		op = "create"
+		op = OpCreate
 	case event.Op.Has(fsnotify.Write):
-		op = "modify"
+		op = OpModify
 	case event.Op.Has(fsnotify.Remove):
-		op = "delete"
+		op = OpDelete
 	default:
 		return
 	}
 
-	w.debouncer.Debounce(event.Name, func() {
-		w.logger.Info("file changed", "path", event.Name, "op", op)
-		w.handler(Event{Path: event.Name, Op: op})
+	w.debounce.Debounce(event.Name, func() {
+		w.logger.Info("file changed", "watcher", w.name, "path", event.Name, "op", op)
+		select {
+		case w.ch <- WatchEvent{WatcherName: w.name, Path: event.Name, Op: op}:
+		default:
+			w.logger.Warn("watcher channel full, dropping event", "watcher", w.name, "path", event.Name)
+		}
 	})
+}
+
+// matches returns true if the path matches an include pattern and no exclude pattern.
+func (w *Watcher) matches(path string) bool {
+	rel, err := filepath.Rel(w.root, path)
+	if err != nil {
+		return false
+	}
+	base := filepath.Base(rel)
+
+	// Check excludes first
+	for _, ex := range w.excludes {
+		if matchGlob(ex, rel) || matchGlob(ex, base) {
+			return false
+		}
+	}
+
+	// No includes = match everything not excluded
+	if len(w.includes) == 0 {
+		return true
+	}
+
+	for _, inc := range w.includes {
+		if matchGlob(inc, rel) || matchGlob(inc, base) {
+			return true
+		}
+	}
+	return false
 }
 
 // isIgnored returns true if the path matches .gitignore rules.
@@ -141,6 +186,28 @@ func (w *Watcher) isIgnored(path string) bool {
 		return false
 	}
 	return w.gitignore.MatchesPath(rel)
+}
+
+// matchGlob supports simple globs and basic ** patterns.
+func matchGlob(pattern, name string) bool {
+	if strings.Contains(pattern, "**") {
+		// For **, match against any suffix of the path components.
+		parts := strings.SplitN(pattern, "**/", 2)
+		if len(parts) == 2 {
+			suffix := parts[1]
+			// Check each path component onwards
+			components := strings.Split(name, string(filepath.Separator))
+			for i := range components {
+				candidate := strings.Join(components[i:], string(filepath.Separator))
+				if m, _ := filepath.Match(suffix, candidate); m {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	m, _ := filepath.Match(pattern, name)
+	return m
 }
 
 // skipDir returns true for directories that should never be watched.
@@ -156,22 +223,11 @@ func skipDir(name string) bool {
 	return false
 }
 
-func (w *Watcher) matchesPattern(path string) bool {
-	rel, err := filepath.Rel(w.root, path)
+// tooBig returns true if the file is larger than maxFileSize.
+func tooBig(path string) bool {
+	info, err := os.Stat(path)
 	if err != nil {
 		return false
 	}
-
-	for _, pattern := range w.patterns {
-		matched, _ := filepath.Match(pattern, rel)
-		if matched {
-			return true
-		}
-		// Also try matching just the filename
-		matched, _ = filepath.Match(pattern, filepath.Base(rel))
-		if matched {
-			return true
-		}
-	}
-	return false
+	return info.Size() > maxFileSize
 }
