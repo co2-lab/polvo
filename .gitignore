@@ -37,6 +37,8 @@ ui/dist/
 
 # Drafts
 *.draft.*
+*-draft/
+*_draft/
 
 # Editor
 .vscode/

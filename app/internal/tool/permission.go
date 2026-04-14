@@ -39,15 +39,33 @@ func NewPermissionChecker(rules []PermissionRule) *PermissionChecker {
 	return &PermissionChecker{rules: m}
 }
 
-// DefaultPermissionRules returns sensible defaults.
+// DefaultPermissionRules returns sensible defaults aligned with industry practice:
+//
+//   - Read-only filesystem tools: auto-allowed (no side-effects)
+//   - Exploration tools (web, memory, think): auto-allowed (external reads, no mutation)
+//   - File mutations (write, edit): ask — developer should review changes
+//   - Shell execution (bash): ask — but low-risk commands are auto-approved by the loop
+//
+// This matches the model used by Claude Code, Cline, and Aider.
 func DefaultPermissionRules() []PermissionRule {
 	return []PermissionRule{
+		// Filesystem reads — always safe
 		{Tool: "read", Level: PermAllow},
 		{Tool: "glob", Level: PermAllow},
 		{Tool: "grep", Level: PermAllow},
 		{Tool: "ls", Level: PermAllow},
+		// Exploration — external reads, no local mutation
+		{Tool: "web_fetch", Level: PermAllow},
+		{Tool: "web_search", Level: PermAllow},
+		// Internal agent tools — no user-visible side effects
+		{Tool: "think", Level: PermAllow},
+		{Tool: "memory_read", Level: PermAllow},
+		{Tool: "memory_write", Level: PermAllow},
+		// File mutations — ask, show preview
 		{Tool: "write", Level: PermAsk},
 		{Tool: "edit", Level: PermAsk},
+		{Tool: "patch", Level: PermAsk},
+		// Shell execution — ask, but loop auto-approves low-risk commands
 		{Tool: "bash", Level: PermAsk},
 	}
 }
@@ -79,6 +97,12 @@ func NewGuardedRegistry(inner *Registry, rules []PermissionRule, askFn AskFunc) 
 // Get returns a tool by name (delegates to inner registry).
 func (g *GuardedRegistry) Get(name string) (Tool, bool) {
 	return g.inner.Get(name)
+}
+
+// CheckLevel returns the permission level for the named tool without executing it.
+// This allows callers to inspect whether a tool requires approval before calling Execute.
+func (g *GuardedRegistry) CheckLevel(name string) PermissionLevel {
+	return g.checker.Check(name)
 }
 
 // All returns all tools (delegates to inner registry).

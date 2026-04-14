@@ -1,0 +1,31 @@
+#!/usr/bin/env sh
+# polvo pre-commit hook
+# Installed automatically when polvo starts in a git repo.
+# Delegates all checks to the polvo binary so config is always respected.
+
+set -e
+
+# Find the polvo binary: prefer the one next to this script's repo root,
+# then fall back to PATH.
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+
+POLVO_BIN=""
+for candidate in \
+  "$REPO_ROOT/bin/polvo" \
+  "$REPO_ROOT/.polvo/bin/polvo"; do
+  if [ -x "$candidate" ]; then
+    POLVO_BIN="$candidate"
+    break
+  fi
+done
+
+if [ -z "$POLVO_BIN" ]; then
+  POLVO_BIN=$(command -v polvo 2>/dev/null) || true
+fi
+
+if [ -z "$POLVO_BIN" ]; then
+  # polvo not found — skip hook silently rather than blocking all commits.
+  exit 0
+fi
+
+exec "$POLVO_BIN" hook pre-commit

@@ -1,4 +1,4 @@
-.PHONY: build ui-dev app-dev tauri-dev clean dev web-dev
+.PHONY: build ui-dev app-dev tauri-dev clean dev web-dev tui
 
 TARGET := $(shell rustc -Vv | grep host | cut -f2 -d' ')
 BUILD_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -19,7 +19,7 @@ dev: kill-server
 	cd app && go build -ldflags "$(LDFLAGS)" -o ../desktop/bin/polvo-$(TARGET) ./cmd/polvo
 	mkdir -p desktop/target/debug
 	cp desktop/bin/polvo-$(TARGET) desktop/target/debug/polvo
-	POLVO_ROOT=$(PWD) npx tauri dev --config desktop/tauri.conf.json
+	cd desktop && POLVO_ROOT=$(PWD) npx tauri dev --config tauri.conf.json
 
 # Desenvolvimento web (sem Tauri): Go server + Vite com proxy
 web-dev: kill-server
@@ -31,7 +31,7 @@ web-dev: kill-server
 build:
 	cd ui && npm run build
 	cd app && make build
-	cd desktop && npx tauri build --config tauri.conf.json
+	cd desktop && npx tauri build
 
 ui-dev:
 	cd ui && npm run dev
@@ -39,8 +39,13 @@ ui-dev:
 app-dev:
 	go run ./app/cmd/polvo
 
+# TUI interativo do agente (sem desktop)
+tui:
+	cd app && go build -ldflags "$(LDFLAGS)" -o ../bin/polvo ./cmd/polvo
+	POLVO_ROOT=$(PWD) ./bin/polvo
+
 tauri-dev:
-	npx tauri dev --config desktop/tauri.conf.json
+	cd desktop && POLVO_ROOT=$(PWD) npx tauri dev --config tauri.conf.json
 
 test:
 	cd app && go test ./...

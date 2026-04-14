@@ -26,6 +26,8 @@ type TokenUsage struct {
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
+	CacheReadTokens  int // tokens served from cache (read hit)
+	CacheWriteTokens int // tokens written to cache (cache creation)
 }
 
 // LLMProvider is the interface for AI model providers.

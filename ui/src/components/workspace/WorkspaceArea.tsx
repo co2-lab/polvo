@@ -407,7 +407,7 @@ export function WorkspaceArea({ agents, logLines }: WorkspaceAreaProps) {
     <div className="flex-1 h-full p-2 overflow-hidden relative">
       {layoutEl ?? (
         <div
-          className="w-full h-full border-2 border-dashed border-white/10 rounded-xl flex flex-col items-center justify-center text-white/40 bg-black/5 gap-3"
+          className="w-full h-full border-2 border-dashed border-white/10 rounded-xl flex flex-col items-center justify-center text-white/40 bg-black/5 gap-3 select-none"
           onDragOver={(e) => e.preventDefault()}
           onDrop={(e) => {
             e.preventDefault()
