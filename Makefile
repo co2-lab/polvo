@@ -8,17 +8,21 @@ LDFLAGS := -X main.CommitSHA=$(BUILD_SHA) -X main.BuildDate=$(BUILD_DATE)
 .PHONY: kill-server
 kill-server:
 	@echo "→ killing polvo processes..."
-	@pkill -9 -f "polvo" 2>/dev/null || true
-	@pkill -9 -f "go-build.*/polvo" 2>/dev/null || true
 	@lsof -ti :7373 | xargs kill -9 2>/dev/null || true
-	@sleep 1
+	@pkill -9 -f "/bin/polvo" 2>/dev/null || true
+	@pkill -9 -f "go-build.*/polvo" 2>/dev/null || true
+	@for i in 1 2 3 4 5; do \
+		if [ -z "$$(lsof -ti :7373)" ]; then break; fi; \
+		sleep 0.5; \
+	done
 	@echo "→ port 7373: $$(lsof -ti :7373 | wc -l | tr -d ' ') processes remaining"
 
 # Tauri app desktop (dev)
 dev: kill-server
 	cd app && go build -ldflags "$(LDFLAGS)" -o ../desktop/bin/polvo-$(TARGET) ./cmd/polvo
-	mkdir -p desktop/target/debug
+	mkdir -p desktop/target/debug bin
 	cp desktop/bin/polvo-$(TARGET) desktop/target/debug/polvo
+	cp desktop/bin/polvo-$(TARGET) bin/polvo
 	cd desktop && POLVO_ROOT=$(PWD) npx tauri dev --config tauri.conf.json
 
 # Desenvolvimento web (sem Tauri): Go server + Vite com proxy

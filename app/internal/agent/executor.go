@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -12,10 +13,13 @@ import (
 	"github.com/co2-lab/polvo/internal/config"
 	"github.com/co2-lab/polvo/internal/git"
 	"github.com/co2-lab/polvo/internal/guide"
+	"github.com/co2-lab/polvo/internal/hooks"
 	"github.com/co2-lab/polvo/internal/ignore"
 	"github.com/co2-lab/polvo/internal/memory"
+	"github.com/co2-lab/polvo/internal/agent/microagent"
 	"github.com/co2-lab/polvo/internal/provider"
 	"github.com/co2-lab/polvo/internal/tool"
+	"github.com/co2-lab/polvo/internal/tool/mcp"
 )
 
 // Executor builds and manages agents from config.
@@ -26,6 +30,7 @@ type Executor struct {
 	agents    map[string]Agent
 	memStore  *memory.Store       // optional; may be nil
 	recallCfg memory.RecallConfig // cross-session recall settings
+	mcpHub    *mcp.MCPHub         // optional; nil when no MCP servers configured
 }
 
 // NewExecutor creates a new agent executor.
@@ -44,6 +49,13 @@ func NewExecutor(resolver *guide.Resolver, registry *provider.Registry, cfg *con
 func (e *Executor) WithMemory(store *memory.Store, cfg memory.RecallConfig) *Executor {
 	e.memStore = store
 	e.recallCfg = cfg
+	return e
+}
+
+// WithMCP attaches a started MCPHub to the executor so its tools are available
+// to all tool-using agents built by this executor.
+func (e *Executor) WithMCP(hub *mcp.MCPHub) *Executor {
+	e.mcpHub = hub
 	return e
 }
 
@@ -234,6 +246,7 @@ func (e *Executor) buildAgent(guideName string, group *config.InterfaceGroupConf
 				Ignore:         ig,
 				SubAgent:       e, // executor implements tool.SubAgentRunner
 				Explore:        e, // executor implements tool.ExploreRunner (only at delegate level 0)
+				MCPHub:         e.mcpHub,
 			}
 			if e.cfg.Settings.PersistentBashSession {
 				toolTimeout := time.Duration(e.cfg.Settings.ToolTimeout) * time.Second
@@ -251,6 +264,34 @@ func (e *Executor) buildAgent(guideName string, group *config.InterfaceGroupConf
 			}
 			toolReg := tool.DefaultRegistry(cwd, toolOpts)
 			agent := NewToolLLMAgent(guideName, role, g.Content, promptContent, cp, gcfg.Model, toolReg)
+			// Wire config-level permission rules so user-defined allow/deny/ask rules take effect.
+			if rules := e.cfg.Permissions.Rules; len(rules) > 0 {
+				permRules := make([]tool.PermissionRule, len(rules))
+				for i, r := range rules {
+					permRules[i] = tool.PermissionRule{Tool: r.Tool, Level: tool.PermissionLevel(r.Level)}
+				}
+				agent.permissionRules = permRules
+			}
+			// Wire microagent loader for context injection.
+			homeDir, _ := os.UserHomeDir()
+			agent.microagentLoader = microagent.NewLoader(
+				filepath.Join(cwd, ".polvo", "microagents"),
+				filepath.Join(homeDir, ".polvo", "microagents"),
+			)
+			// Wire hooks runner from config.
+			if e.cfg != nil {
+				hCfg := &hooks.Config{
+					BeforeToolCall:  e.cfg.Hooks.BeforeToolCall,
+					AfterToolCall:   e.cfg.Hooks.AfterToolCall,
+					BeforeModelCall: e.cfg.Hooks.BeforeModelCall,
+					AfterModelCall:  e.cfg.Hooks.AfterModelCall,
+					OnAgentStart:    e.cfg.Hooks.OnAgentStart,
+					OnAgentDone:     e.cfg.Hooks.OnAgentDone,
+				}
+				if !hCfg.IsEmpty() {
+					agent.hooksRunner = hooks.NewRunner(hCfg, 5*time.Second)
+				}
+			}
 			if gcfg.ArchitectEditor.Enabled {
 				agent.WithArchitectEditor(ArchitectEditorConfig{
 					Enabled:           true,

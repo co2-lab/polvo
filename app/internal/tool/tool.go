@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/co2-lab/polvo/internal/git"
+	"github.com/co2-lab/polvo/internal/tool/mcp"
 )
 
 // Tool is a capability that an LLM can invoke.
@@ -76,7 +77,8 @@ type RegistryOptions struct {
 	Cache          *ToolCache     // optional: shared result cache for read, glob, grep, ls
 	BashSession    *BashSession   // optional: persistent bash session; when set the bash tool runs inside it
 	GitClient      git.Client     // optional: enables the diff tool
-		GitPath        string         // optional: git repo path, defaults to workdir
+	GitPath        string         // optional: git repo path, defaults to workdir
+	MCPHub         *mcp.MCPHub   // optional: enables MCP tools from all connected servers
 }
 
 // DefaultRegistry creates a registry with all built-in tools.
@@ -111,6 +113,11 @@ func DefaultRegistry(workdir string, opts ...RegistryOptions) *Registry {
 	}
 	if o.GitClient != nil {
 		r.Register(NewDiff(o.GitClient))
+	}
+	if o.MCPHub != nil {
+		for _, def := range o.MCPHub.Tools() {
+			r.Register(&mcpToolAdapter{def: def, hub: o.MCPHub})
+		}
 	}
 	return r
 }

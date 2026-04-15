@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -22,6 +23,7 @@ import (
 	"github.com/co2-lab/polvo/internal/provider"
 	"github.com/co2-lab/polvo/internal/server"
 	"github.com/co2-lab/polvo/internal/tool"
+	"github.com/co2-lab/polvo/internal/tool/mcp"
 	"github.com/co2-lab/polvo/internal/tui"
 	"github.com/co2-lab/polvo/internal/watcher"
 )
@@ -206,11 +208,18 @@ func runTUI() error {
 
 	// ── Launch TUI ────────────────────────────────────────────────────────────
 
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
 	ig, _ := ignore.Load(cwd)
-	toolReg := tool.DefaultRegistry(cwd, tool.RegistryOptions{
+	tuiToolOpts := tool.RegistryOptions{
 		BraveAPIKey: cfg.Settings.BraveAPIKey,
 		Ignore:      ig,
-	})
+	}
+	if hub := startMCPHub(ctx, cwd); hub != nil {
+		tuiToolOpts.MCPHub = hub
+	}
+	toolReg := tool.DefaultRegistry(cwd, tuiToolOpts)
 
 	systemPrompt := fmt.Sprintf(`You are Polvo, an AI coding agent running in interactive CLI mode.
 Working directory: %s
@@ -236,9 +245,6 @@ RESPONSE STYLE:
 		System:   systemPrompt,
 		MaxTurns: 50,
 	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 
 	return tui.Run(ctx, tuiCfg)
 }
@@ -283,6 +289,9 @@ func runServer() {
 		registry, _ = provider.NewRegistry(cfg.Providers)
 		resolver = guide.NewResolver(cwd, cfg)
 		executor = agent.NewExecutor(resolver, registry, cfg)
+		if hub := startMCPHub(context.Background(), cwd); hub != nil {
+			executor.WithMCP(hub)
+		}
 		scheduler = pipeline.NewScheduler(executor, nil, cfg, logger, bus)
 		dispatcher = watcher.NewDispatcher(cfg, executor, eventCh, logger)
 	}
@@ -325,6 +334,16 @@ func runServer() {
 		port = "7373"
 	}
 	addr := "127.0.0.1:" + port
+
+	// If another instance is already listening on the port, exit cleanly.
+	// This can happen when Tauri hot-reloads and spawns a new sidecar before
+	// the old one has fully terminated.
+	if ln, err := net.Listen("tcp", addr); err != nil {
+		slog.Warn("port already in use, another instance is running", "addr", addr)
+		os.Exit(0)
+	} else {
+		ln.Close()
+	}
 
 	srv := server.NewServer(addr, bus, ".polvo/reports", dashDeps, cwd)
 
@@ -450,6 +469,33 @@ func redirectLogsToFile(cwd string) error {
 	return nil
 }
 
+
+// startMCPHub loads MCP config from .polvo/mcp.json (project) or ~/.polvo/mcp.json (user)
+// and starts the hub. Returns nil (non-fatal) if no config file is found or startup fails.
+func startMCPHub(ctx context.Context, cwd string) *mcp.MCPHub {
+	// Try project-local config first, then user-level config.
+	paths := []string{
+		filepath.Join(cwd, ".polvo", "mcp.json"),
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".polvo", "mcp.json"))
+	}
+
+	for _, p := range paths {
+		cfg, err := mcp.LoadMCPConfig(p)
+		if err != nil || len(cfg.MCPServers) == 0 {
+			continue
+		}
+		hub := mcp.NewMCPHub(cfg)
+		if err := hub.Start(ctx); err != nil {
+			slog.Warn("mcp: hub start failed", "path", p, "error", err)
+			continue
+		}
+		slog.Info("mcp: hub started", "path", p, "servers", len(cfg.MCPServers))
+		return hub
+	}
+	return nil
+}
 
 func classifyEvent(path string) pipeline.EventType {
 	if len(path) > 8 && path[len(path)-8:] == ".spec.md" {

@@ -2,12 +2,13 @@ import {
   FolderOpen, Code2, TerminalSquare, MessageSquare, GitCompare,
   ScrollText, Activity, TerminalIcon,
 } from 'lucide-react'
-import { ClaudeIcon, GeminiIcon } from './AIIcons'
+import { ClaudeIcon, GeminiIcon, PolvoIcon } from './AIIcons'
 import type { PanelKind } from '../../types/ide'
 
 const AI_ICONS: Record<string, React.ReactNode> = {
   claude: <ClaudeIcon size={13} />,
   gemini: <GeminiIcon size={13} />,
+  polvo: <PolvoIcon size={13} />,
 }
 
 const KIND_ICONS: Record<PanelKind, React.ReactNode> = {

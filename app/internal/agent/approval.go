@@ -129,7 +129,13 @@ func previewAndRisk(toolName string, input json.RawMessage) (preview, risk strin
 		if path == "" {
 			return "write file", risk
 		}
-		return "write " + path, risk
+		content := str("content")
+		if content != "" {
+			preview = diffPreview(path, "", content, 8)
+		} else {
+			preview = "write " + path
+		}
+		return preview, risk
 
 	case "edit":
 		path := str("path")
@@ -137,7 +143,14 @@ func previewAndRisk(toolName string, input json.RawMessage) (preview, risk strin
 		if path == "" {
 			return "edit file", risk
 		}
-		return "edit " + path, risk
+		oldStr := str("old_string")
+		newStr := str("new_string")
+		if oldStr != "" || newStr != "" {
+			preview = diffPreview(path, oldStr, newStr, 8)
+		} else {
+			preview = "edit " + path
+		}
+		return preview, risk
 
 	case "patch":
 		path := str("path")
@@ -235,4 +248,54 @@ func DefaultApprovalCallback(autonomy AutonomyMode) PermissionCallback {
 	default: // AutonomySupervised
 		return nil // caller must provide ChannelCallback
 	}
+}
+
+// diffPreview generates a compact unified-diff-style preview for approval UI.
+// For write operations, oldStr should be empty and newStr is the new content.
+// For edit operations, oldStr/newStr are the before/after strings.
+// maxLines limits the number of lines shown (0 = no limit).
+func diffPreview(path, oldStr, newStr string, maxLines int) string {
+	var sb strings.Builder
+	sb.WriteString("--- " + path + "\n")
+	sb.WriteString("+++ " + path + "\n")
+
+	// Show removed lines
+	if oldStr != "" {
+		for i, line := range splitLines(oldStr) {
+			if maxLines > 0 && i >= maxLines/2 {
+				sb.WriteString("- …\n")
+				break
+			}
+			sb.WriteString("- " + line + "\n")
+		}
+	}
+
+	// Show added lines
+	if newStr != "" {
+		newLines := splitLines(newStr)
+		limit := len(newLines)
+		truncated := false
+		if maxLines > 0 && limit > maxLines {
+			limit = maxLines
+			truncated = true
+		}
+		for _, line := range newLines[:limit] {
+			sb.WriteString("+ " + line + "\n")
+		}
+		if truncated {
+			sb.WriteString("+ …\n")
+		}
+	}
+
+	return sb.String()
+}
+
+// splitLines splits s into lines without trailing newlines.
+func splitLines(s string) []string {
+	lines := strings.Split(s, "\n")
+	// Trim trailing empty line from final newline.
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
 }

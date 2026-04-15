@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -14,6 +15,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/co2-lab/polvo/internal/agent"
+	"github.com/co2-lab/polvo/internal/agent/checkpoint"
+	"github.com/co2-lab/polvo/internal/agent/microagent"
 	"github.com/co2-lab/polvo/internal/provider"
 	"github.com/co2-lab/polvo/internal/tool"
 )
@@ -31,7 +34,7 @@ type Config struct {
 // Run starts the bubbletea TUI and blocks until the user exits.
 func Run(ctx context.Context, cfg Config) error {
 	m := newModel(ctx, cfg)
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithInput(os.Stdin))
 	m.perm.prog = p
 	final, err := p.Run()
 	if err != nil {
@@ -85,7 +88,6 @@ var (
 	
 	// solid backgrounds for header/footer
 	styleStatusBg  = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("250")).Padding(0, 1)
-	styleHeaderBg  = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("250")).Padding(0, 1).Bold(true)
 
 	// tool icons by name
 	toolIcons = map[string]string{
@@ -262,6 +264,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "running…"
 				return m, nil
 			}
+			if !m.agentRunning {
+				prompt := strings.TrimSpace(m.textarea.Value())
+				if prompt != "" {
+					m.textarea.Reset()
+					return m, m.startAgent(prompt)
+				}
+			}
 
 		case tea.KeyRunes:
 			if m.awaitingApproval && string(msg.Runes) == "a" {
@@ -272,14 +281,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.approvalResCh <- agent.ApprovalAllow
 				m.status = "running…"
 				return m, tea.Cmd(func() tea.Msg { return approvalSessionMsg{toolName: toolName} })
-			}
-			if !m.agentRunning {
-				prompt := strings.TrimSpace(m.textarea.Value())
-				if prompt == "" {
-					return m, nil
-				}
-				m.textarea.Reset()
-				return m, m.startAgent(prompt)
 			}
 
 		case tea.KeyEsc:
@@ -407,7 +408,7 @@ func (m model) renderHeader() string {
 	dir := compactPath(m.cfg.WorkDir)
 	model := m.cfg.Model
 
-	left := styleHeaderBg.Render(wordmark) + "  " + styleMuted.Render(dir) + styleDim.Render(" • ") + styleMuted.Render(model)
+	left := wordmark + "  " + styleMuted.Render(dir) + styleDim.Render(" • ") + styleMuted.Render(model)
 
 	right := ""
 	if m.agentRunning && m.cfg.MaxTurns > 0 {
@@ -533,6 +534,23 @@ func (m *model) startAgent(prompt string) tea.Cmd {
 	toolCallCh := make(chan toolCallMsg, 16)
 	doneCh := make(chan agentDoneMsg, 1)
 
+	// Initialise a checkpoint recorder for this run (non-fatal if it fails).
+	var ckptRecorder *checkpoint.Recorder
+	ckptDir := filepath.Join(m.cfg.WorkDir, ".polvo", "checkpoints")
+	if store := checkpoint.NewFSStore(ckptDir); store != nil {
+		sessionID := fmt.Sprintf("tui-%d", time.Now().UnixNano())
+		if rec, err := checkpoint.NewRecorder(store, sessionID, "tui"); err == nil {
+			ckptRecorder = rec
+		}
+	}
+
+	// Load microagents for context injection.
+	homeDir, _ := os.UserHomeDir()
+	maLoader := microagent.NewLoader(
+		filepath.Join(m.cfg.WorkDir, ".polvo", "microagents"),
+		filepath.Join(homeDir, ".polvo", "microagents"),
+	)
+
 	loopCfg := agent.LoopConfig{
 		Provider:           m.cfg.Provider,
 		Tools:              m.cfg.ToolReg,
@@ -540,6 +558,8 @@ func (m *model) startAgent(prompt string) tea.Cmd {
 		Model:              m.cfg.Model,
 		MaxTurns:           maxTurns,
 		PermissionCallback: m.perm,
+		Checkpoint:         ckptRecorder,
+		MicroagentLoader:   maLoader,
 		OnTextDelta: func(d string) {
 			deltaCh <- d
 		},
@@ -558,6 +578,13 @@ func (m *model) startAgent(prompt string) tea.Cmd {
 
 	go func() {
 		_, err := l.Run(ctx, prompt)
+		if ckptRecorder != nil {
+			status := "completed"
+			if err != nil {
+				status = "failed"
+			}
+			_ = ckptRecorder.Finish(status)
+		}
 		doneCh <- agentDoneMsg{err: err}
 	}()
 

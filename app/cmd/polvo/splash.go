@@ -123,26 +123,16 @@ func showSplash(version, workDir string, cfg *config.Config, registry ProviderRe
 
 		chosen := entries[provIdx]
 
-		// ── Model selection ───────────────────────────────────────────────────
-
-		lastModel := p.LastModel[chosen.alias]
-		if lastModel == "" {
-			lastModel = chosen.pcfg.DefaultModel
-		}
-
-		model, err := pickModelForProvider(chosen.alias, chosen.prov, lastModel)
-		if err != nil {
-			return nil, err
+		// Use last-used model for this provider, falling back to default.
+		model := p.LastModel[chosen.alias]
+		if model == "" {
+			model = chosen.pcfg.DefaultModel
 		}
 		fmt.Println()
 
 		// ── Persist prefs ─────────────────────────────────────────────────────
 
 		p.LastProvider = chosen.alias
-		if p.LastModel == nil {
-			p.LastModel = map[string]string{}
-		}
-		p.LastModel[chosen.alias] = model
 		savePrefs(p)
 
 		cp, ok := chosen.prov.(provider.ChatProvider)

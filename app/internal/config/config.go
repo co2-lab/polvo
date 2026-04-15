@@ -298,9 +298,17 @@ type PermissionsConfig struct {
 	Blocklist []string         `koanf:"blocklist"` // command prefix/exact patterns to block in bash
 }
 
-// HooksConfig configures git hook behavior.
+// HooksConfig configures git hook behavior and agent lifecycle hooks.
 type HooksConfig struct {
 	PreCommit PreCommitHookConfig `koanf:"pre_commit"`
+	// Agent lifecycle hooks — shell commands executed at various agent loop points.
+	// Each command receives JSON on stdin.
+	BeforeToolCall  []string `koanf:"before_tool_call"`
+	AfterToolCall   []string `koanf:"after_tool_call"`
+	BeforeModelCall []string `koanf:"before_model_call"`
+	AfterModelCall  []string `koanf:"after_model_call"`
+	OnAgentStart    []string `koanf:"on_agent_start"`
+	OnAgentDone     []string `koanf:"on_agent_done"`
 }
 
 // PreCommitHookConfig configures the pre-commit hook.

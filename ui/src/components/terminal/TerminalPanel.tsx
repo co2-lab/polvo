@@ -83,6 +83,9 @@ export function TerminalPanel({ sessionId = 'default', executable }: TerminalPan
     fitAddonRef.current = fitAddon
 
     term.open(containerRef.current)
+    // Ensure all key events are processed by xterm (fixes input on macOS WebKit/Tauri)
+    term.attachCustomKeyEventHandler(() => true)
+    term.focus()
 
     const sendResize = (cols: number, rows: number) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return
@@ -169,6 +172,7 @@ export function TerminalPanel({ sessionId = 'default', executable }: TerminalPan
       ref={containerRef}
       className="w-full h-full"
       style={{ padding: '4px 8px', boxSizing: 'border-box' }}
+      onClick={() => termRef.current?.focus()}
     />
   )
 }

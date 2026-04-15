@@ -159,8 +159,8 @@ const initialDockItems: DockItem[] = [
   { id: 'explorer', name: 'Explorer', icon: 'FolderTree', type: 'tool' },
   { id: 'editor', name: 'Editor', icon: 'FileCode', type: 'tool' },
   { id: 'terminal', name: 'Terminal', icon: 'Terminal', type: 'tool' },
-  { id: 'cli-polvo', name: 'Polvo', icon: 'ai:polvo', type: 'ai', command: 'polvo' },
   { id: 'diff', name: 'Diff', icon: 'GitCompare', type: 'tool' },
+  { id: 'cli-polvo', name: 'Polvo', icon: 'ai:polvo', type: 'ai', command: 'polvo' },
 ]
 
 const predefinedThemes: ThemeDef[] = [
@@ -880,8 +880,8 @@ export const useIDEStore = create<IDEState>()(
       storage: createJSONStorage(() => localStorage),
       migrate: (persisted: unknown, version: number) => {
         const state = persisted as Record<string, unknown>
-        if (version < 9) {
-          // Ensure cli-polvo appears before diff in dock items
+        if (version < 10) {
+          // Ensure cli-polvo appears after diff in dock items
           const dockItems = Array.isArray(state.dockItems)
             ? (state.dockItems as Array<Record<string, unknown>>)
             : []
@@ -891,7 +891,7 @@ export const useIDEStore = create<IDEState>()(
             id: 'cli-polvo', name: 'Polvo', icon: 'ai:polvo', type: 'ai', command: 'polvo',
           }
           if (diffIdx !== -1) {
-            withoutPolvo.splice(diffIdx, 0, polvoItem)
+            withoutPolvo.splice(diffIdx + 1, 0, polvoItem)
           } else {
             withoutPolvo.push(polvoItem)
           }
@@ -971,26 +971,36 @@ export const useIDEStore = create<IDEState>()(
         if (!state) return
         const existingIds = new Set(state.dockItems.map(i => i.id))
         const missing = initialDockItems.filter(i => !existingIds.has(i.id))
-        if (missing.length > 0) {
-          // Merge missing items in their initialDockItems order relative to existing items.
-          // For each missing item, insert it before the first existing item that comes
-          // after it in initialDockItems, so the final order matches the intended default order.
-          const merged = [...state.dockItems]
-          for (const item of missing) {
-            const defaultIdx = initialDockItems.findIndex(d => d.id === item.id)
-            // Find the first item in merged that has a higher index in initialDockItems
-            const insertBefore = merged.findIndex(m => {
-              const mIdx = initialDockItems.findIndex(d => d.id === m.id)
-              return mIdx > defaultIdx
-            })
-            if (insertBefore === -1) {
-              merged.push(item)
-            } else {
-              merged.splice(insertBefore, 0, item)
+        const merged = [...state.dockItems]
+        // Insert missing items in their initialDockItems order relative to existing items.
+        for (const item of missing) {
+          const defaultIdx = initialDockItems.findIndex(d => d.id === item.id)
+          const insertBefore = merged.findIndex(m => {
+            const mIdx = initialDockItems.findIndex(d => d.id === m.id)
+            return mIdx > defaultIdx
+          })
+          if (insertBefore === -1) {
+            merged.push(item)
+          } else {
+            merged.splice(insertBefore, 0, item)
+          }
+        }
+        // Reorder existing items to match initialDockItems order when they diverge.
+        // Only reorder items that exist in initialDockItems; user-added items stay in place.
+        const knownIds = new Set(initialDockItems.map(d => d.id))
+        const knownInMerged = merged.filter(i => knownIds.has(i.id))
+        const expectedOrder = initialDockItems.filter(d => knownInMerged.some(i => i.id === d.id))
+        const isCorrectOrder = knownInMerged.every((item, idx) => item.id === expectedOrder[idx]?.id)
+        if (!isCorrectOrder) {
+          let expectedIdx = 0
+          for (let i = 0; i < merged.length; i++) {
+            if (knownIds.has(merged[i].id)) {
+              merged[i] = { ...merged[i], ...expectedOrder[expectedIdx] }
+              expectedIdx++
             }
           }
-          state.dockItems = merged
         }
+        state.dockItems = merged
       },
       // Only persist layout-related state; transient UI state is excluded.
       // projects and activeProjectId are NOT persisted — they come from the backend.

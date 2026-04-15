@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 
 	"github.com/creack/pty"
@@ -103,7 +104,15 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	} else {
 		cmd = exec.CommandContext(ctx, shell)
 	}
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	// Filter out POLVO_SIDECAR so child processes (e.g. polvo TUI) don't
+	// inherit sidecar mode and try to start another HTTP server.
+	filteredEnv := make([]string, 0, len(os.Environ()))
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "POLVO_SIDECAR=") {
+			filteredEnv = append(filteredEnv, e)
+		}
+	}
+	cmd.Env = append(filteredEnv, "TERM=xterm-256color")
 
 	ptmx, err := pty.Start(cmd)
 	if err != nil {

@@ -8,7 +8,10 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/co2-lab/polvo/internal/agent/checkpoint"
+	"github.com/co2-lab/polvo/internal/agent/microagent"
 	"github.com/co2-lab/polvo/internal/audit"
+	"github.com/co2-lab/polvo/internal/hooks"
 	"github.com/co2-lab/polvo/internal/memory"
 	"github.com/co2-lab/polvo/internal/provider"
 	"github.com/co2-lab/polvo/internal/tool"
@@ -63,6 +66,11 @@ type LoopConfig struct {
 	// Architect/editor two-phase loop
 	ArchitectEditor ArchitectEditorConfig
 
+	// PermissionRules overrides the default tool permission rules.
+	// When nil, DefaultPermissionRules() is used.
+	// These rules are consulted when GuardedTools is nil.
+	PermissionRules []tool.PermissionRule
+
 	// Approval gates: called before executing ask-permission tools.
 	// nil = allow all (backward-compatible).
 	PermissionCallback PermissionCallback
@@ -70,6 +78,18 @@ type LoopConfig struct {
 	// Audit logging: every tool call is logged with decision + duration.
 	// nil = no audit logging.
 	AuditLogger audit.Logger
+
+	// Checkpoint recorder: records events and file snapshots for time-travel.
+	// nil = no checkpointing.
+	Checkpoint *checkpoint.Recorder
+
+	// MicroagentLoader loads context-injecting microagents.
+	// When set, matched microagents are prepended to the system prompt before the first turn.
+	// nil = no microagent injection.
+	MicroagentLoader *microagent.Loader
+
+	// Hooks runner for lifecycle events (nil = disabled).
+	Hooks *hooks.Runner
 
 	// Callbacks
 	OnText       func(text string)
@@ -140,6 +160,27 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 
 	l.conv.AddUser(userPrompt)
 
+	// Record initial user message for checkpoint.
+	if l.cfg.Checkpoint != nil {
+		_ = l.cfg.Checkpoint.RecordMessage(checkpoint.EventUserMessage, userPrompt)
+	}
+
+	// Fire on_agent_start hook.
+	l.cfg.Hooks.RunOnAgentStart(l.cfg.System, userPrompt)
+
+	// Inject matched microagents into the system prompt.
+	system := l.cfg.System
+	if l.cfg.MicroagentLoader != nil {
+		agents, _ := l.cfg.MicroagentLoader.LoadAll()
+		if len(agents) > 0 {
+			evalCtx := microagent.EvalContext{UserMessage: userPrompt}
+			matches := microagent.Match(agents, evalCtx)
+			if injection := microagent.Inject(matches, 5); injection != "" {
+				system = system + "\n\n" + injection
+			}
+		}
+	}
+
 	var totalTokens provider.TokenUsage
 	turnCount := 0
 	reflectionRetries := 0
@@ -174,7 +215,7 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 
 		chatReq := provider.ChatRequest{
 			Model:     l.cfg.Model,
-			System:    l.cfg.System,
+			System:    system,
 			Messages:  messages,
 			Tools:     toolDefs,
 			MaxTokens: l.cfg.MaxTokens,
@@ -182,6 +223,9 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 
 		var resp *provider.ChatResponse
 		var err error
+
+		// Fire before_model_call hook.
+		l.cfg.Hooks.RunBeforeModelCall(l.cfg.System, l.cfg.Model, turnCount)
 
 		// Use streaming when available and delta callback is set
 		if sp, ok := l.cfg.Provider.(provider.StreamProvider); ok && l.cfg.OnTextDelta != nil {
@@ -207,6 +251,9 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 		}
 		l.consecutiveTimeouts = 0
 
+		// Fire after_model_call hook.
+		l.cfg.Hooks.RunAfterModelCall(l.cfg.System, l.cfg.Model, turnCount, resp.TokensUsed.TotalTokens)
+
 		totalTokens.PromptTokens += resp.TokensUsed.PromptTokens
 		totalTokens.CompletionTokens += resp.TokensUsed.CompletionTokens
 		totalTokens.TotalTokens += resp.TokensUsed.TotalTokens
@@ -219,6 +266,11 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 		// Fire text callback for any text content
 		if resp.Message.Content != "" && l.cfg.OnText != nil {
 			l.cfg.OnText(resp.Message.Content)
+		}
+
+		// Record assistant message for checkpoint.
+		if l.cfg.Checkpoint != nil && resp.Message.Content != "" {
+			_ = l.cfg.Checkpoint.RecordMessage(checkpoint.EventAssistant, resp.Message.Content)
 		}
 
 		// No tool calls → agent is done; run reflection before returning
@@ -262,6 +314,7 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 				"context_pressure", metrics.ContextWindowPressure,
 				"model", l.cfg.Model,
 			)
+			l.cfg.Hooks.RunOnAgentDone(l.cfg.System, turnCount, "")
 			return &LoopResult{
 				FinalText:         resp.Message.Content,
 				TurnCount:         turnCount,
@@ -280,6 +333,14 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 				l.cfg.OnToolCall(tc)
 			}
 
+			// Record tool call event for checkpoint time-travel.
+			if l.cfg.Checkpoint != nil {
+				_ = l.cfg.Checkpoint.RecordToolCall(tc.Name, tc.Input)
+			}
+
+			// Fire before_tool_call hook.
+			l.cfg.Hooks.RunBeforeToolCall(l.cfg.System, tc.Name, tc.Input)
+
 			result := l.executeTool(ctx, tc)
 
 			// Track consecutive timeouts on tool calls
@@ -294,6 +355,19 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 			}
 
 			l.conv.AddToolResult(tc.ID, result.Content, result.IsError)
+
+			// Record tool result and file-modified events.
+			if l.cfg.Checkpoint != nil {
+				_ = l.cfg.Checkpoint.RecordToolResult(tc.Name, result.Content, result.IsError)
+				if !result.IsError && isFileMutatingTool(tc.Name) {
+					if path := extractPathArg(tc.Input); path != "" {
+						_ = l.cfg.Checkpoint.RecordFileModified(path)
+					}
+				}
+			}
+
+			// Fire after_tool_call hook.
+			l.cfg.Hooks.RunAfterToolCall(l.cfg.System, tc.Name, tc.Input, result.Content, result.IsError)
 
 			// Track for stuck detection
 			inputStr := ""
@@ -535,12 +609,16 @@ func (l *Loop) executeTool(ctx context.Context, tc provider.ToolCall) *tool.Resu
 		return result
 	}
 
-	// Resolve permission level: use GuardedTools if available, else default rules.
+	// Resolve permission level: use GuardedTools if available, else rules from config or defaults.
 	var permLevel tool.PermissionLevel
 	if l.cfg.GuardedTools != nil {
 		permLevel = l.cfg.GuardedTools.CheckLevel(tc.Name)
 	} else {
-		checker := tool.NewPermissionChecker(tool.DefaultPermissionRules())
+		rules := l.cfg.PermissionRules
+		if len(rules) == 0 {
+			rules = tool.DefaultPermissionRules()
+		}
+		checker := tool.NewPermissionChecker(rules)
 		permLevel = checker.Check(tc.Name)
 	}
 
@@ -589,4 +667,33 @@ func (l *Loop) executeTool(ctx context.Context, tc provider.ToolCall) *tool.Resu
 		return auditLog(tool.ErrorResult(fmt.Sprintf("tool error: %v", err)))
 	}
 	return auditLog(result)
+}
+
+// isFileMutatingTool returns true for tools that modify files on disk.
+func isFileMutatingTool(name string) bool {
+	switch name {
+	case "write", "edit", "patch", "undo_edit":
+		return true
+	}
+	return false
+}
+
+// extractPathArg extracts the "path" field from a JSON tool input, if present.
+func extractPathArg(input json.RawMessage) string {
+	if input == nil {
+		return ""
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(input, &m); err != nil {
+		return ""
+	}
+	raw, ok := m["path"]
+	if !ok {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return ""
+	}
+	return s
 }
