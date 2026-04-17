@@ -351,11 +351,21 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 		defer cancel()
 	}
 
+	slog.Debug("agent_loop_start",
+		"session", l.cfg.SessionID,
+		"model", l.cfg.Model,
+		"max_turns", l.cfg.MaxTurns,
+		"max_tokens", l.cfg.MaxTokens,
+		"prompt_len", len(userPrompt),
+	)
+
 	l.conv.AddUser(userPrompt)
 
 	// Record initial user message for checkpoint.
 	if l.cfg.Checkpoint != nil {
-		_ = l.cfg.Checkpoint.RecordMessage(checkpoint.EventUserMessage, userPrompt)
+		if err := l.cfg.Checkpoint.RecordMessage(checkpoint.EventUserMessage, userPrompt); err != nil {
+			slog.Warn("checkpoint: failed to record user message", "session", l.cfg.SessionID, "err", err)
+		}
 	}
 
 	// Fire on_agent_start hook.
@@ -417,6 +427,14 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 		var resp *provider.ChatResponse
 		var err error
 
+		slog.Debug("llm_request",
+			"session", l.cfg.SessionID,
+			"model", l.cfg.Model,
+			"turn", turnCount,
+			"messages", len(messages),
+			"tools", len(toolDefs),
+		)
+
 		// Fire before_model_call hook.
 		l.cfg.Hooks.RunBeforeModelCall(l.cfg.System, l.cfg.Model, turnCount)
 
@@ -445,6 +463,12 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 			})
 		}
 		if err != nil {
+			slog.Debug("llm_error",
+				"session", l.cfg.SessionID,
+				"model", l.cfg.Model,
+				"turn", turnCount,
+				"err", err,
+			)
 			// Retry retriable provider errors (rate limit, overload, server errors)
 			// using exponential backoff with the server's Retry-After hint.
 			if retriable, retryAfter := provider.IsRetriableErr(err); retriable {
@@ -516,6 +540,17 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 		l.consecutiveTimeouts = 0
 		l.providerRetries = 0
 
+		slog.Debug("llm_response",
+			"session", l.cfg.SessionID,
+			"model", l.cfg.Model,
+			"turn", turnCount,
+			"stop_reason", resp.StopReason,
+			"tool_calls", len(resp.Message.ToolCalls),
+			"prompt_tokens", resp.TokensUsed.PromptTokens,
+			"completion_tokens", resp.TokensUsed.CompletionTokens,
+			"cache_read_tokens", resp.TokensUsed.CacheReadTokens,
+		)
+
 		// Fire after_model_call hook.
 		l.cfg.Hooks.RunAfterModelCall(l.cfg.System, l.cfg.Model, turnCount, resp.TokensUsed.TotalTokens)
 
@@ -554,7 +589,9 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 
 		// Record assistant message for checkpoint.
 		if l.cfg.Checkpoint != nil && resp.Message.Content != "" {
-			_ = l.cfg.Checkpoint.RecordMessage(checkpoint.EventAssistant, resp.Message.Content)
+			if err := l.cfg.Checkpoint.RecordMessage(checkpoint.EventAssistant, resp.Message.Content); err != nil {
+				slog.Warn("checkpoint: failed to record assistant message", "session", l.cfg.SessionID, "err", err)
+			}
 		}
 
 		// No tool calls → agent is done; run reflection before returning
@@ -576,9 +613,22 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 					if reflectionRetries < l.cfg.Reflector.MaxRetries() {
 						reflectionRetries++
 						metrics.ReflectionCount++
+						slog.Debug("reflection_retry",
+							"session", l.cfg.SessionID,
+							"model", l.cfg.Model,
+							"turn", turnCount,
+							"failed_phase", failedPhase,
+							"retry", reflectionRetries,
+						)
 						l.conv.AddUser(feedback)
 						continue // feed error back for a new iteration
 					}
+					slog.Warn("reflection_failed",
+						"session", l.cfg.SessionID,
+						"model", l.cfg.Model,
+						"failed_phase", failedPhase,
+						"retries_exhausted", reflectionRetries,
+					)
 				}
 			}
 
@@ -588,6 +638,8 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 			metrics.CostUSD = provider.ComputeCostUSD(totalTokens, l.cfg.Model)
 			metrics.computePressure(l.cfg.MaxTokens)
 			slog.Info("agent_loop_completed",
+				"session", l.cfg.SessionID,
+				"model", l.cfg.Model,
 				"turns", turnCount,
 				"prompt_tokens", totalTokens.PromptTokens,
 				"completion_tokens", totalTokens.CompletionTokens,
@@ -596,7 +648,6 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 				"cost_usd", metrics.CostUSD,
 				"duration_ms", metrics.Duration.Milliseconds(),
 				"context_pressure", metrics.ContextWindowPressure,
-				"model", l.cfg.Model,
 			)
 			l.cfg.Hooks.RunOnAgentDone(l.cfg.System, turnCount, "")
 			if l.cfg.EventStream != nil {
@@ -621,6 +672,14 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 		for _, tc := range resp.Message.ToolCalls {
 			metrics.recordToolCall(tc.Name)
 
+			slog.Debug("tool_call",
+				"session", l.cfg.SessionID,
+				"model", l.cfg.Model,
+				"turn", turnCount,
+				"tool", tc.Name,
+				"input", string(tc.Input),
+			)
+
 			if l.cfg.OnToolCall != nil {
 				l.cfg.OnToolCall(tc)
 			}
@@ -637,7 +696,9 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 
 			// Record tool call event for checkpoint time-travel.
 			if l.cfg.Checkpoint != nil {
-				_ = l.cfg.Checkpoint.RecordToolCall(tc.Name, tc.Input)
+				if err := l.cfg.Checkpoint.RecordToolCall(tc.Name, tc.Input); err != nil {
+					slog.Warn("checkpoint: failed to record tool call", "tool", tc.Name, "err", err)
+				}
 			}
 
 			// Fire before_tool_call hook.
@@ -658,12 +719,34 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 
 			l.conv.AddToolResult(tc.ID, result.Content, result.IsError)
 
+			if result.IsError {
+				slog.Debug("tool_error",
+					"session", l.cfg.SessionID,
+					"model", l.cfg.Model,
+					"turn", turnCount,
+					"tool", tc.Name,
+					"result", result.Content,
+				)
+			} else {
+				slog.Debug("tool_result",
+					"session", l.cfg.SessionID,
+					"model", l.cfg.Model,
+					"turn", turnCount,
+					"tool", tc.Name,
+					"result_len", len(result.Content),
+				)
+			}
+
 			// Record tool result and file-modified events.
 			if l.cfg.Checkpoint != nil {
-				_ = l.cfg.Checkpoint.RecordToolResult(tc.Name, result.Content, result.IsError)
+				if err := l.cfg.Checkpoint.RecordToolResult(tc.Name, result.Content, result.IsError); err != nil {
+					slog.Warn("checkpoint: failed to record tool result", "tool", tc.Name, "err", err)
+				}
 				if !result.IsError && isFileMutatingTool(tc.Name) {
 					if path := extractPathArg(tc.Input); path != "" {
-						_ = l.cfg.Checkpoint.RecordFileModified(path)
+						if err := l.cfg.Checkpoint.RecordFileModified(path); err != nil {
+							slog.Warn("checkpoint: failed to record file modified", "path", path, "err", err)
+						}
 					}
 				}
 			}
@@ -709,6 +792,12 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 
 		// Check stuck after processing all tool calls in this turn
 		if pattern, stuck := l.stuck.CheckAll(); stuck {
+			slog.Warn("agent_stuck",
+				"session", l.cfg.SessionID,
+				"model", l.cfg.Model,
+				"turn", turnCount,
+				"pattern", pattern,
+			)
 			metrics.StuckCount++
 			stuckErr := fmt.Errorf("agent stuck: same tool+input repeated %d times in last %d calls — aborting",
 				l.cfg.StuckThreshold, l.cfg.StuckWindowSize)

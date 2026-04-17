@@ -1,3 +1,5 @@
+.polvo/
+
 # Environment
 .env
 .env.local

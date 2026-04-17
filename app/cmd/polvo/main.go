@@ -423,7 +423,16 @@ func buildAddProviderFn() func() ([]tui.ProviderOption, error) {
 
 // runServer is the existing HTTP server mode, used when launched as a Tauri sidecar.
 func runServer() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logLevel := slog.LevelInfo
+	seqURL := os.Getenv("SEQ_URL")
+	if seqURL != "" {
+		logLevel = slog.LevelDebug
+	}
+	h := slog.Handler(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+	if seqURL != "" {
+		h = telemetry.NewMultiHandler(h, telemetry.NewSeqHandler(seqURL, "polvo-server", slog.LevelDebug))
+	}
+	logger := slog.New(h)
 	slog.SetDefault(logger)
 
 	bus := server.NewBus()
@@ -660,7 +669,16 @@ func redirectLogsToFile(cwd string) error {
 		return err
 	}
 	_ = cwd // available for future structured log fields
-	slog.SetDefault(slog.New(slog.NewTextHandler(logFile, nil)))
+	logLevel := slog.LevelInfo
+	seqURL := os.Getenv("SEQ_URL")
+	if seqURL != "" {
+		logLevel = slog.LevelDebug
+	}
+	h := slog.Handler(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: logLevel}))
+	if seqURL != "" {
+		h = telemetry.NewMultiHandler(h, telemetry.NewSeqHandler(seqURL, "polvo-tui", slog.LevelDebug))
+	}
+	slog.SetDefault(slog.New(h))
 	return nil
 }
 

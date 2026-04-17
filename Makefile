@@ -5,6 +5,7 @@ BUILD_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE := $(shell date -u +%Y%m%d-%H%M%S)
 LDFLAGS      := -X main.CommitSHA=$(BUILD_SHA) -X main.BuildDate=$(BUILD_DATE)
 LDFLAGS_DEV  := $(LDFLAGS)
+SEQ_URL      ?= http://localhost:5341
 
 .PHONY: kill-server
 kill-server:
@@ -27,7 +28,7 @@ dev: kill-server
 	mkdir -p desktop/target/debug bin
 	cp desktop/bin/polvo-$(TARGET) desktop/target/debug/polvo
 	cp desktop/bin/polvo-$(TARGET) bin/polvo
-	cd desktop && POLVO_ROOT=$(PWD) npx tauri dev --config tauri.conf.json
+	cd desktop && SEQ_URL=$(SEQ_URL) POLVO_ROOT=$(PWD) npx tauri dev --config tauri.conf.json
 
 # Same as dev but wipes WebKit localStorage first (use when UI state is broken)
 dev-reset: kill-server
@@ -37,12 +38,12 @@ dev-reset: kill-server
 	mkdir -p desktop/target/debug bin
 	cp desktop/bin/polvo-$(TARGET) desktop/target/debug/polvo
 	cp desktop/bin/polvo-$(TARGET) bin/polvo
-	cd desktop && POLVO_ROOT=$(PWD) npx tauri dev --config tauri.conf.json
+	cd desktop && SEQ_URL=$(SEQ_URL) POLVO_ROOT=$(PWD) npx tauri dev --config tauri.conf.json
 
 # Desenvolvimento web (sem Tauri): Go server + Vite com proxy
 web-dev: kill-server
 	@echo "→ starting Go server (port 7373)..."
-	POLVO_ROOT=$(PWD) go run -ldflags "$(LDFLAGS_DEV)" ./app/cmd/polvo &
+	SEQ_URL=$(SEQ_URL) POLVO_ROOT=$(PWD) go run -ldflags "$(LDFLAGS_DEV)" ./app/cmd/polvo &
 	@echo "→ starting Vite dev server..."
 	cd ui && npm run dev
 
@@ -62,7 +63,7 @@ app-dev:
 
 tui: generate
 	cd app && go build -ldflags "$(LDFLAGS_DEV)" -o ../bin/polvo ./cmd/polvo
-	POLVO_ROOT=$(PWD) ./bin/polvo
+	SEQ_URL=$(SEQ_URL) POLVO_ROOT=$(PWD) ./bin/polvo
 
 tauri-dev:
 	cd desktop && POLVO_ROOT=$(PWD) npx tauri dev --config tauri.conf.json
