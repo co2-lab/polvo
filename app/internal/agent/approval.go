@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/co2-lab/polvo/internal/policy"
+	"github.com/co2-lab/polvo/internal/risk"
 )
 
 // ApprovalRequest is sent to the PermissionCallback before executing a tool
@@ -23,8 +26,11 @@ type ApprovalRequest struct {
 type ApprovalDecision int
 
 const (
-	ApprovalAllow ApprovalDecision = iota
+	ApprovalAllow          ApprovalDecision = iota
 	ApprovalDeny
+	ApprovalAllowSession   // allow now + create session-scoped policy (no disk write)
+	ApprovalAllowPermanent // allow now + create permanent policy (written to disk)
+	ApprovalDenySession    // deny now + create session-scoped deny policy
 )
 
 // PermissionCallback is called before executing any tool that has "ask" permission.
@@ -234,6 +240,72 @@ func classifyBashRisk(cmd string) string {
 
 	// Default: treat unknown commands as medium — ask but don't alarm.
 	return "medium"
+}
+
+// PolicyChannelCallback wraps ChannelCallback with a PolicyStore short-circuit.
+// Before delegating to the inner channel, it checks for a matching policy and
+// short-circuits if one is found. Decisions carrying session/permanent scope
+// are converted into policies and stored for future calls.
+type PolicyChannelCallback struct {
+	Inner    *ChannelCallback
+	Policies *policy.PolicyStore
+	Scorer   risk.RiskScorer
+}
+
+func (c *PolicyChannelCallback) RequestApproval(ctx context.Context, req ApprovalRequest) (ApprovalDecision, error) {
+	// Authoritative risk scoring — overwrite whatever the LLM supplied.
+	scorer := c.Scorer
+	if scorer == nil {
+		scorer = risk.NoopScorer{}
+	}
+	computedRisk := scorer.Score(req.ToolName, req.ToolInput)
+	req.RiskLevel = computedRisk.String()
+
+	// Policy short-circuit: if a matching policy exists, return immediately.
+	if c.Policies != nil {
+		if decision, ok := c.Policies.Evaluate(req.AgentName, req.ToolName, computedRisk); ok {
+			if decision == policy.PolicyAllow {
+				return ApprovalAllow, nil
+			}
+			return ApprovalDeny, nil
+		}
+	}
+
+	// Delegate to the inner channel.
+	extended, err := c.Inner.RequestApproval(ctx, req)
+	if err != nil {
+		return ApprovalDeny, err
+	}
+
+	// Translate extended decisions into policies and canonicalize.
+	if c.Policies != nil {
+		switch extended {
+		case ApprovalAllowSession:
+			_ = c.Policies.Upsert(policy.Policy{
+				Scope:    policy.PolicyScope{AgentName: req.AgentName, ToolName: req.ToolName},
+				Decision: policy.PolicyAllow,
+				TTL:      policy.TTLSession,
+			})
+			return ApprovalAllow, nil
+		case ApprovalAllowPermanent:
+			_ = c.Policies.Upsert(policy.Policy{
+				Scope:    policy.PolicyScope{AgentName: req.AgentName, ToolName: req.ToolName},
+				Decision: policy.PolicyAllow,
+				TTL:      policy.TTLPermanent,
+			})
+			return ApprovalAllow, nil
+		case ApprovalDenySession:
+			_ = c.Policies.Upsert(policy.Policy{
+				Scope:    policy.PolicyScope{AgentName: req.AgentName, ToolName: req.ToolName},
+				Decision: policy.PolicyDeny,
+				TTL:      policy.TTLSession,
+			})
+			return ApprovalDeny, nil
+		}
+	}
+
+	// Pass through Allow/Deny unchanged.
+	return extended, nil
 }
 
 // DefaultApprovalCallback returns an appropriate PermissionCallback for the given autonomy mode.

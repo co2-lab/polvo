@@ -1,4 +1,4 @@
-.PHONY: build ui-dev app-dev tauri-dev clean dev web-dev tui
+.PHONY: build ui-dev app-dev tauri-dev clean dev dev-reset web-dev tui generate
 
 TARGET := $(shell rustc -Vv | grep host | cut -f2 -d' ')
 BUILD_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
@@ -17,8 +17,22 @@ kill-server:
 	done
 	@echo "→ port 7373: $$(lsof -ti :7373 | wc -l | tr -d ' ') processes remaining"
 
+# In dev mode Tauri uses identifier "app"; in release it uses "io.co2lab.polvo"
+WEBKIT_STORAGE_DEV     := $(HOME)/Library/WebKit/app/WebsiteData
+WEBKIT_STORAGE_RELEASE := $(HOME)/Library/WebKit/io.co2lab.polvo/WebsiteData
+
 # Tauri app desktop (dev)
 dev: kill-server
+	cd app && go build -ldflags "$(LDFLAGS)" -o ../desktop/bin/polvo-$(TARGET) ./cmd/polvo
+	mkdir -p desktop/target/debug bin
+	cp desktop/bin/polvo-$(TARGET) desktop/target/debug/polvo
+	cp desktop/bin/polvo-$(TARGET) bin/polvo
+	cd desktop && POLVO_ROOT=$(PWD) npx tauri dev --config tauri.conf.json
+
+# Same as dev but wipes WebKit localStorage first (use when UI state is broken)
+dev-reset: kill-server
+	@echo "→ clearing WebKit storage..."
+	@rm -rf "$(WEBKIT_STORAGE_DEV)" "$(WEBKIT_STORAGE_RELEASE)"
 	cd app && go build -ldflags "$(LDFLAGS)" -o ../desktop/bin/polvo-$(TARGET) ./cmd/polvo
 	mkdir -p desktop/target/debug bin
 	cp desktop/bin/polvo-$(TARGET) desktop/target/debug/polvo
@@ -32,7 +46,10 @@ web-dev: kill-server
 	@echo "→ starting Vite dev server..."
 	cd ui && npm run dev
 
-build:
+generate:
+	cd app && go generate ./internal/provider/...
+
+build: generate
 	cd ui && npm run build
 	cd app && make build
 	cd desktop && npx tauri build
@@ -44,7 +61,7 @@ app-dev:
 	go run ./app/cmd/polvo
 
 # TUI interativo do agente (sem desktop)
-tui:
+tui: generate
 	cd app && go build -ldflags "$(LDFLAGS)" -o ../bin/polvo ./cmd/polvo
 	POLVO_ROOT=$(PWD) ./bin/polvo
 

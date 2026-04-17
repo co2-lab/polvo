@@ -146,45 +146,51 @@ export function WorkspaceTabs() {
     if (maximized) { win.unmaximize() } else { win.maximize() }
   }, [isTauri])
 
-  const renderTab = (ws: typeof workspaces[0]) => (
-    <div key={ws.id} className="relative shrink-0">
-      {renamingId === ws.id ? (
-        <input
-          ref={renameInputRef}
-          value={renameValue}
-          onChange={e => setRenameValue(e.target.value)}
-          onBlur={commitRename}
-          onKeyDown={e => {
-            if (e.key === 'Enter') commitRename()
-            if (e.key === 'Escape') setRenamingId(null)
-          }}
-          className="px-3 py-1.5 rounded-md text-sm font-medium bg-white/10 border border-white/20 text-white outline-none w-32"
-        />
-      ) : (
-        <button
-          onClick={() => setActiveWorkspace(ws.id)}
-          onContextMenu={e => handleContextMenu(e, ws.id)}
-          onDoubleClick={() => startRename(ws.id, ws.name)}
-          className={clsx(
-            'flex items-center gap-2 px-4 py-1.5 rounded-md text-sm font-medium transition-all border border-transparent select-none',
-            activeWorkspaceId === ws.id
-              ? 'bg-white/10 text-white shadow-sm border-white/5'
-              : 'text-white/50 hover:bg-white/5 hover:text-white/80'
-          )}
-        >
-          {pinnedWorkspaceIds.includes(ws.id)
-            ? <Pin className="w-3 h-3 opacity-50" />
-            : <LayoutTemplate className="w-4 h-4 opacity-70" />
-          }
-          {ws.name}
-        </button>
-      )}
-    </div>
-  )
+  const renderTab = (ws: typeof workspaces[0]) => {
+    const isActive = activeWorkspaceId === ws.id
+    return (
+      <div key={ws.id} className="relative shrink-0">
+        {renamingId === ws.id ? (
+          <input
+            ref={renameInputRef}
+            value={renameValue}
+            onChange={e => setRenameValue(e.target.value)}
+            onBlur={commitRename}
+            onKeyDown={e => {
+              if (e.key === 'Enter') commitRename()
+              if (e.key === 'Escape') setRenamingId(null)
+            }}
+            className="px-3 py-1.5 text-sm font-medium bg-white/10 border border-white/20 text-white outline-none w-32"
+          />
+        ) : (
+          <button
+            onClick={() => setActiveWorkspace(ws.id)}
+            onContextMenu={e => handleContextMenu(e, ws.id)}
+            onDoubleClick={() => startRename(ws.id, ws.name)}
+            className={clsx(
+              'group flex items-center gap-2 px-3 h-8 text-sm font-medium transition-all select-none cursor-pointer border-b-2',
+              isActive
+                ? 'text-white border-[color:var(--primary)] bg-white/5'
+                : 'text-white/45 border-transparent hover:text-white/80'
+            )}
+            style={!isActive ? {
+              ['--tw-hover-bg' as string]: 'color-mix(in srgb, var(--primary) 8%, transparent)',
+            } : undefined}
+          >
+            {pinnedWorkspaceIds.includes(ws.id)
+              ? <Pin className="w-3 h-3 opacity-50" />
+              : <LayoutTemplate className="w-4 h-4 opacity-70" />
+            }
+            {ws.name}
+          </button>
+        )}
+      </div>
+    )
+  }
 
   return (
     <div
-      className="h-11 bg-black/10 border-b border-white/10 flex items-center px-2 gap-1 relative shrink-0"
+      className="h-8 bg-black/10 border-b border-white/10 flex items-center px-2 gap-1 relative shrink-0"
       style={isMacosTauri ? { paddingLeft: '88px' } : undefined}
       data-tauri-drag-region
     >

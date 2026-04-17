@@ -127,6 +127,64 @@ func (c *LLMSummaryCondenser) Condense(ctx context.Context, messages []provider.
 	return result, nil
 }
 
+// AmortizedCondenser drops middle messages when count exceeds MaxSize,
+// keeping the first KeepFirst messages and the last MaxSize/2 messages.
+// It never calls an LLM, making it O(1) in LLM tokens — useful as a cheap
+// first stage before LLMSummaryCondenser.
+type AmortizedCondenser struct {
+	MaxSize   int // trigger threshold (default 60)
+	KeepFirst int // system/initial messages always kept (default 2)
+}
+
+func (c *AmortizedCondenser) Condense(_ context.Context, messages []provider.Message, _ int) ([]provider.Message, error) {
+	maxSize := c.MaxSize
+	if maxSize <= 0 {
+		maxSize = 60
+	}
+	keepFirst := c.KeepFirst
+	if keepFirst <= 0 {
+		keepFirst = 2
+	}
+	if len(messages) <= maxSize {
+		return messages, nil
+	}
+	tailSize := maxSize / 2
+	if keepFirst > len(messages) {
+		keepFirst = len(messages)
+	}
+	head := messages[:keepFirst]
+	startTail := len(messages) - tailSize
+	if startTail < keepFirst {
+		startTail = keepFirst
+	}
+	tail := messages[startTail:]
+	result := make([]provider.Message, 0, len(head)+len(tail))
+	result = append(result, head...)
+	result = append(result, tail...)
+	return result, nil
+}
+
+// PipelineCondenser runs a sequence of Condensers in order, stopping at the
+// first stage that actually reduces the message count. Composes strategies
+// without requiring a single monolithic condenser.
+// Example composition: ObservationMasking → Amortized → LLMSummary
+type PipelineCondenser struct {
+	Stages []Condenser
+}
+
+func (c *PipelineCondenser) Condense(ctx context.Context, messages []provider.Message, maxTokens int) ([]provider.Message, error) {
+	for _, stage := range c.Stages {
+		result, err := stage.Condense(ctx, messages, maxTokens)
+		if err != nil {
+			return messages, err
+		}
+		if len(result) < len(messages) {
+			return result, nil
+		}
+	}
+	return messages, nil
+}
+
 // maxSummarizeDepth is the maximum recursion depth for SummarizeKeepTail.
 const maxSummarizeDepth = 3
 

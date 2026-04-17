@@ -10,8 +10,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
+	"time"
+
+	"database/sql"
 
 	"github.com/co2-lab/polvo/internal/agent"
 	"github.com/co2-lab/polvo/internal/config"
@@ -21,11 +25,15 @@ import (
 	"github.com/co2-lab/polvo/internal/memory"
 	"github.com/co2-lab/polvo/internal/pipeline"
 	"github.com/co2-lab/polvo/internal/provider"
+	"github.com/co2-lab/polvo/internal/repomap"
 	"github.com/co2-lab/polvo/internal/server"
+	"github.com/co2-lab/polvo/internal/session"
+	"github.com/co2-lab/polvo/internal/skill"
 	"github.com/co2-lab/polvo/internal/tool"
 	"github.com/co2-lab/polvo/internal/tool/mcp"
 	"github.com/co2-lab/polvo/internal/tui"
 	"github.com/co2-lab/polvo/internal/watcher"
+	_ "modernc.org/sqlite"
 )
 
 // Version is set via ldflags at build time.
@@ -158,6 +166,35 @@ func runTUI() error {
 		defer memStore.Close()
 	}
 
+	// Start chunk indexer in background (non-fatal if it fails).
+	// IndexAll runs in a goroutine; the indexer is also passed to tui.Config
+	// so the TUI can update it when the user edits files via the agent.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	_, tuiIndexer := startIndexer(ctx2, cwd)
+	_ = tuiIndexer // used in tuiCfg below
+
+	// Open session manager (shared memory.db, non-fatal).
+	var sessMgr *session.Manager
+	var summRunner *session.SummaryRunner
+	if sessDB, err := openSessionDB(cwd); err == nil {
+		if mgr, merr := session.Open(sessDB); merr == nil {
+			sessMgr = mgr
+			// Use LLM summarizer when summary_model is configured; otherwise noop.
+			var summarizer session.Summarizer = session.NoopSummarizer{}
+			if cfg != nil && cfg.Settings.SummaryModel != "" {
+				// Provider registry not yet initialised here; wired after splash below.
+				// We store the model name and create the LLM summarizer after registry is ready.
+				_ = cfg.Settings.SummaryModel // placeholder — see post-splash wiring
+			}
+			summRunner = session.NewSummaryRunner(mgr, summarizer)
+		} else {
+			slog.Warn("session manager: open failed", "err", merr)
+		}
+	} else {
+		slog.Warn("session manager: db open failed", "err", err)
+	}
+
 	// ── Splash screen ─────────────────────────────────────────────────────────
 	// Always show the splash screen. If no providers are configured it will
 	// return nil and we fall through to the setup wizard.
@@ -237,16 +274,140 @@ RESPONSE STYLE:
 - Show results, not process. Don't narrate what you're about to do.
 - If a task is simple, answer simply.`, cwd)
 
+	// Build provider options for the /model picker.
+	var providerOptions []tui.ProviderOption
+	for name, pcfg := range cfg.Providers {
+		p, err := registry.Get(name)
+		if err != nil {
+			continue
+		}
+		cp, ok := p.(provider.ChatProvider)
+		if !ok {
+			continue
+		}
+		model := pcfg.DefaultModel
+		if model == "" {
+			continue
+		}
+		providerOptions = append(providerOptions, tui.ProviderOption{
+			Label:    name + " · " + model,
+			Provider: cp,
+			Model:    model,
+		})
+	}
+	// Sort for stable order.
+	sort.Slice(providerOptions, func(i, j int) bool {
+		return providerOptions[i].Label < providerOptions[j].Label
+	})
+
+	// Upgrade SummaryRunner to LLM-backed if summary_model is configured.
+	var summaryProvider provider.ChatProvider
+	summaryModel := ""
+	if cfg != nil && cfg.Settings.SummaryModel != "" {
+		summaryModel = cfg.Settings.SummaryModel
+		if p, err := registry.Default(); err == nil {
+			if cp, ok := p.(provider.ChatProvider); ok {
+				summaryProvider = cp
+				if sessMgr != nil && summRunner != nil {
+					summRunner = session.NewSummaryRunner(sessMgr, agent.LLMSummarizer{
+						Provider: cp,
+						Model:    summaryModel,
+					})
+				}
+			}
+		}
+	}
+
+	// Inject known project skills into the system prompt.
+	if memStore != nil {
+		if entries, rerr := memStore.Read(memory.Filter{Type: "decision", Limit: 5}); rerr == nil && len(entries) > 0 {
+			var sb strings.Builder
+			sb.WriteString("\n\n## Procedimentos conhecidos para este projeto:\n")
+			for _, e := range entries {
+				ts := time.Unix(0, e.Timestamp).Format("2006-01-02")
+				fmt.Fprintf(&sb, "- [%s] %s\n", ts, e.Content)
+			}
+			systemPrompt += sb.String()
+		}
+	}
+
+	// Build skill extractor (uses summary provider when available — cheaper model).
+	var skillExtractor *skill.Extractor
+	if memStore != nil && sel != nil {
+		skillExtractor = &skill.Extractor{
+			Provider: sel.Provider,
+			Model:    sel.Model,
+			Store:    memStore,
+		}
+		if summaryProvider != nil && summaryModel != "" {
+			skillExtractor.Provider = summaryProvider
+			skillExtractor.Model = summaryModel
+		}
+	}
+
 	tuiCfg := tui.Config{
-		WorkDir:  cwd,
-		Provider: sel.Provider,
-		Model:    sel.Model,
-		ToolReg:  toolReg,
-		System:   systemPrompt,
-		MaxTurns: 50,
+		WorkDir:         cwd,
+		Provider:        sel.Provider,
+		Model:           sel.Model,
+		ToolReg:         toolReg,
+		System:          systemPrompt,
+		MaxTurns:        50,
+		ProviderOptions: providerOptions,
+		AddProviderFn:   buildAddProviderFn(),
+		Indexer:         tuiIndexer,
+		SessionManager:  sessMgr,
+		SummaryRunner:   summRunner,
+		SummaryModel:    summaryModel,
+		SummaryProvider: summaryProvider,
+		SkillExtractor:  skillExtractor,
 	}
 
 	return tui.Run(ctx, tuiCfg)
+}
+
+// buildAddProviderFn returns a function that runs the setup wizard and returns
+// an updated list of ProviderOptions for the TUI /model picker.
+func buildAddProviderFn() func() ([]tui.ProviderOption, error) {
+	return func() ([]tui.ProviderOption, error) {
+		if _, err := runSetupWizard(false); err != nil {
+			return nil, err
+		}
+
+		newCfg, err := config.LoadWithUser("")
+		if err != nil || newCfg == nil || len(newCfg.Providers) == 0 {
+			return nil, fmt.Errorf("no provider configured after setup")
+		}
+
+		newRegistry, err := provider.NewRegistry(newCfg.Providers)
+		if err != nil {
+			return nil, fmt.Errorf("provider registry: %w", err)
+		}
+
+		var opts []tui.ProviderOption
+		for name, pcfg := range newCfg.Providers {
+			p, err := newRegistry.Get(name)
+			if err != nil {
+				continue
+			}
+			cp, ok := p.(provider.ChatProvider)
+			if !ok {
+				continue
+			}
+			model := pcfg.DefaultModel
+			if model == "" {
+				continue
+			}
+			opts = append(opts, tui.ProviderOption{
+				Label:    name + " · " + model,
+				Provider: cp,
+				Model:    model,
+			})
+		}
+		sort.Slice(opts, func(i, j int) bool {
+			return opts[i].Label < opts[j].Label
+		})
+		return opts, nil
+	}
 }
 
 // runServer is the existing HTTP server mode, used when launched as a Tauri sidecar.
@@ -285,6 +446,9 @@ func runServer() {
 
 	eventCh := make(chan watcher.WatchEvent, 64)
 
+	// Start chunk indexer in background (non-fatal).
+	_, srvIndexer := startIndexer(context.Background(), cwd)
+
 	if cfg != nil {
 		registry, _ = provider.NewRegistry(cfg.Providers)
 		resolver = guide.NewResolver(cwd, cfg)
@@ -293,6 +457,15 @@ func runServer() {
 			executor.WithMCP(hub)
 		}
 		scheduler = pipeline.NewScheduler(executor, nil, cfg, logger, bus)
+		// Wire supervisor router when supervisor_model is configured.
+		if cfg.Settings.SupervisorModel != "" {
+			if p, err := registry.Default(); err == nil {
+				if cp, ok := p.(provider.ChatProvider); ok {
+					sup := pipeline.NewSupervisor(cp, cfg.Settings.SupervisorModel, nil, cfg.Settings.SupervisorConfidenceThreshold)
+					scheduler.WithSupervisor(sup)
+				}
+			}
+		}
 		dispatcher = watcher.NewDispatcher(cfg, executor, eventCh, logger)
 	}
 
@@ -392,6 +565,7 @@ func runServer() {
 							return
 						}
 						bus.PublishFileChanged(event.Path)
+						handleIndexEvent(srvIndexer, event)
 						if scheduler == nil {
 							continue
 						}
@@ -497,9 +671,71 @@ func startMCPHub(ctx context.Context, cwd string) *mcp.MCPHub {
 	return nil
 }
 
+// startIndexer opens the chunk index, creates an Indexer, and triggers IndexAll
+// in a background goroutine. Returns (chunkIndex, indexer, cleanup).
+// All return values may be nil if the DB cannot be opened — non-fatal.
+func startIndexer(ctx context.Context, cwd string) (*repomap.ChunkIndex, *repomap.Indexer) {
+	dbPath := filepath.Join(cwd, ".polvo", "index.db")
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		slog.Warn("indexer: cannot create .polvo dir", "err", err)
+		return nil, nil
+	}
+	idx, err := repomap.OpenChunkIndex(dbPath)
+	if err != nil {
+		slog.Warn("indexer: cannot open chunk index", "err", err)
+		return nil, nil
+	}
+	ix := repomap.NewIndexer(cwd, idx)
+	go func() {
+		ictx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		if err := ix.IndexAll(ictx); err != nil {
+			slog.Warn("indexer: IndexAll failed", "err", err)
+		} else {
+			slog.Info("indexer: IndexAll done")
+		}
+	}()
+	return idx, ix
+}
+
+// handleIndexEvent updates the chunk index and .symbols sidecar for a file event.
+func handleIndexEvent(ix *repomap.Indexer, ev watcher.WatchEvent) {
+	if ix == nil {
+		return
+	}
+	go func() {
+		switch ev.Op {
+		case watcher.OpCreate, watcher.OpModify:
+			if err := ix.IndexFile(ev.Path); err != nil {
+				slog.Warn("indexer: IndexFile", "path", ev.Path, "err", err)
+			}
+		case watcher.OpDelete:
+			if err := ix.RemoveFile(ev.Path); err != nil {
+				slog.Warn("indexer: RemoveFile", "path", ev.Path, "err", err)
+			}
+		}
+	}()
+}
+
 func classifyEvent(path string) pipeline.EventType {
 	if len(path) > 8 && path[len(path)-8:] == ".spec.md" {
 		return pipeline.EventSpecChanged
 	}
 	return pipeline.EventInterfaceChanged
+}
+
+// openSessionDB opens (or creates) .polvo/memory.db for use by the session manager.
+// The session manager shares the same file as memory.Store but uses its own *sql.DB
+// connection so it can create its own tables without touching memory.Store internals.
+func openSessionDB(cwd string) (*sql.DB, error) {
+	dir := filepath.Join(cwd, ".polvo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, "memory.db"))
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	return db, nil
 }

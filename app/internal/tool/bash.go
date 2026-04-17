@@ -14,10 +14,7 @@ import (
 	"github.com/co2-lab/polvo/internal/secrets"
 )
 
-const (
-	defaultTimeout = 120 * time.Second
-	maxOutputBytes = 100 * 1024 // 100KB
-)
+const defaultTimeout = 120 * time.Second
 
 // defaultBlocklist contains commands that are blocked by default for safety.
 // Three layers: prefix match, exact match, and substring patterns.
@@ -146,10 +143,7 @@ func (t *bashTool) Execute(ctx context.Context, input json.RawMessage) (*Result,
 
 		output, exitCode, err := t.session.Run(sessionCtx, in.Command)
 
-		// Truncate if too large.
-		if len(output) > maxOutputBytes {
-			output = output[:maxOutputBytes] + "\n... (output truncated at 100KB)"
-		}
+		output = TruncateObservation(output, DefaultMaxObservationChars)
 
 		// Mask secrets in command output before returning.
 		output, _ = secrets.MaskSecrets(output)
@@ -193,10 +187,7 @@ func (t *bashTool) Execute(ctx context.Context, input json.RawMessage) (*Result,
 		output += stderr.String()
 	}
 
-	// Truncate if too large
-	if len(output) > maxOutputBytes {
-		output = output[:maxOutputBytes] + "\n... (output truncated at 100KB)"
-	}
+	output = TruncateObservation(output, DefaultMaxObservationChars)
 
 	// Mask secrets in command output before returning.
 	output, _ = secrets.MaskSecrets(output)

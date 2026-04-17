@@ -45,7 +45,12 @@ Para lidar com limites de tokens, o Polvo utiliza uma estratégia de cascata (Co
 
 1.  **LLM Summarization:** Usa um modelo mais barato para resumir as partes mais antigas da conversa, mantendo o final intacto.
 2.  **Observation Masking:** Substitui outputs de ferramentas antigos por placeholders (ex: `[tool output omitted - 500 chars]`).
-3.  **Sliding Window / Pruning:** Truncagem inteligente das mensagens mais antigas como último recurso.
+3.  **Amortized Condenser:** Descarta o meio do histórico (sem LLM) quando ultrapassa `MaxSize` mensagens — O(1) em tokens.
+4.  **Sliding Window / Pruning:** Truncagem inteligente das mensagens mais antigas como último recurso.
+
+### Session Tasks & Questions (Roadmap)
+
+`/task <prompt>` e `/question <prompt>` — comandos planejados (plano 52) que resetam o contexto agêntico intencionalmente, agrupam as mensagens de cada unidade de trabalho e geram um summary automático em background ao término. O usuário pode referenciar tasks anteriores com `@@task[task#02]` no próximo prompt — o sistema aguarda o summary e injeta o contexto inline antes de enviar ao modelo.
 
 ## 5. Segurança e Autonomia
 
@@ -82,6 +87,14 @@ Gera uma visão condensada do repositório para o LLM:
 *   **Symbol Extraction:** Extrai funções, classes e tipos exportados (suporta Go, TS/JS, Python).
 *   **Token Budgeting:** Garante que o mapa do repositório caiba dentro de um limite de tokens (ex: 2000 tokens).
 *   **Focus Boosting:** Aumenta a pontuação de arquivos relevantes para a tarefa atual para priorizá-los no mapa.
+*   **Build Cache (TTL):** Resultado em memória com TTL de 30s para evitar recomputação entre turnos da mesma sessão.
+
+### 6.4 Indexação BM25 (ChunkIndex)
+Paralelamente ao repo map de símbolos, o `ChunkIndex` mantém um índice SQLite com FTS5 (BM25) sobre chunks do código fonte, usado pela tool `search_code`:
+*   **Indexação no startup:** `Indexer.IndexAll()` é chamado em background goroutine na inicialização — incremental por hash de arquivo.
+*   **Atualização via watcher:** Quando um arquivo muda, `Indexer.IndexFile(path)` atualiza os chunks afetados em goroutine separada.
+*   **Limpeza ao deletar:** `ChunkIndex.DeleteByPath(path)` remove chunks de arquivos deletados.
+*   **Verificação via /doctor:** `/doctor` verifica se o índice está populado e oferece reindex automático como fix.
 
 ## 7. Funcionalidades Avançadas
 

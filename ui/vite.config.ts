@@ -15,6 +15,9 @@ export default defineConfig({
     }),
   ],
   server: {
+    watch: {
+      ignored: ['**/*.symbols'],
+    },
     proxy: {
       '/api': { target: 'http://127.0.0.1:7373', changeOrigin: true },
       '/events': { target: 'http://127.0.0.1:7373', changeOrigin: true, ws: true },

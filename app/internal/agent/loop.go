@@ -14,6 +14,7 @@ import (
 	"github.com/co2-lab/polvo/internal/hooks"
 	"github.com/co2-lab/polvo/internal/memory"
 	"github.com/co2-lab/polvo/internal/provider"
+	"github.com/co2-lab/polvo/internal/risk"
 	"github.com/co2-lab/polvo/internal/tool"
 )
 
@@ -33,6 +34,52 @@ type ContextFallbackConfig struct {
 	SummaryProvider provider.ChatProvider
 	// SummaryModel is the model to use for summarization.
 	SummaryModel string
+}
+
+// Phase identifies a named execution phase in a multi-phase loop.
+type Phase string
+
+const (
+	PhaseContext Phase = "context" // read-only exploration
+	PhasePlan    Phase = "plan"    // planning / reasoning
+	PhaseBuild   Phase = "build"   // implementation (full tools)
+	PhaseVerify  Phase = "verify"  // tests + lint
+	PhaseCommit  Phase = "commit"  // git commit
+)
+
+// PhaseBudget configures per-phase execution parameters.
+type PhaseBudget struct {
+	MaxTokens int    // token budget for this phase (0 = use LoopConfig.MaxTokens)
+	MaxTurns  int    // max turns (0 = use LoopConfig.MaxTurns)
+	Model     string // model override (empty = use LoopConfig.Model)
+}
+
+// SuspendSignal is sent on SuspendCh when the loop needs human input to continue.
+type SuspendSignal struct {
+	SessionID    string
+	CheckpointID string
+	Reason       checkpoint.SuspendReason
+	Preview      string // human-readable description of the situation
+}
+
+// LoopControl provides granular interrupt/abort/resume signalling for a running loop.
+// All channels are created by the caller; zero values (nil channels) are ignored.
+type LoopControl struct {
+	// Close (or send) to request a clean pause after the current tool batch.
+	Interrupt chan struct{}
+	// Close (or send) to abort the loop immediately (cancels context).
+	Abort chan struct{}
+	// Close (or send) to resume after a clean pause.
+	Resume chan struct{}
+}
+
+// NewLoopControl creates a LoopControl with all channels initialized.
+func NewLoopControl() *LoopControl {
+	return &LoopControl{
+		Interrupt: make(chan struct{}),
+		Abort:     make(chan struct{}),
+		Resume:    make(chan struct{}),
+	}
 }
 
 // LoopConfig configures the agentic loop.
@@ -91,11 +138,58 @@ type LoopConfig struct {
 	// Hooks runner for lifecycle events (nil = disabled).
 	Hooks *hooks.Runner
 
+	// RiskScorer scores tool calls before execution.
+	// nil = use risk.NoopScorer (backward compat).
+	RiskScorer risk.RiskScorer
+
+	// SessionID is propagated to audit entries.
+	SessionID string
+
+	// SuspendCh, when non-nil, receives a SuspendSignal when the loop suspends
+	// (e.g. consecutive timeouts). The caller should persist state and then send
+	// human input via ResumeCh to continue execution.
+	SuspendCh chan<- SuspendSignal
+
+	// ResumeCh receives the human guidance string that lets the loop continue
+	// after a suspension. Only consulted when SuspendCh is non-nil.
+	ResumeCh <-chan string
+
+	// SteerCh, when non-nil, allows mid-task real-time steering.
+	// Between tool-call batches the loop drains SteerCh and injects any
+	// pending messages as user turns, changing the agent's direction without
+	// restarting the session. Messages are injected non-blocking.
+	SteerCh <-chan string
+
+	// Control, when non-nil, provides granular interrupt/abort/resume signalling.
+	// Interrupt: loop pauses cleanly after the current tool batch completes.
+	// Abort: loop stops immediately (context cancelled).
+	// Resume: loop continues after a pause.
+	Control *LoopControl
+
+	// InlineSummary enables extraction of <summary>...</summary> blocks from
+	// model responses. When true, the summary tag is stripped from the visible
+	// response and delivered via OnTurnSummary. Use when no dedicated
+	// SummaryProvider is configured.
+	InlineSummary bool
+
+	// PhaseBudgets sets per-phase token, turn, and model overrides.
+	// When CurrentPhase is set, the matching budget overrides MaxTokens/MaxTurns/Model.
+	PhaseBudgets map[Phase]PhaseBudget
+
+	// CurrentPhase, when set, activates the corresponding PhaseBudget overrides.
+	// Emitted via EventStream as EventTurnStart.Kind annotations.
+	CurrentPhase Phase
+
+	// EventStream receives typed loop events (tool calls, LLM turns, approvals, errors).
+	// nil = no event streaming. Subscribers call EventStream.Subscribe() before Run().
+	EventStream *EventStream
+
 	// Callbacks
-	OnText       func(text string)
-	OnTextDelta  func(delta string)
-	OnToolCall   func(call provider.ToolCall)
-	OnToolResult func(id, name, result string, isError bool)
+	OnText        func(text string)
+	OnTextDelta   func(delta string)
+	OnToolCall    func(call provider.ToolCall)
+	OnToolResult  func(id, name, result string, isError bool)
+	OnTurnSummary func(turnIdx int, summary string) // called when inline summary extracted
 }
 
 // LoopResult is the outcome of a loop execution.
@@ -117,8 +211,103 @@ type Loop struct {
 	consecutiveTimeouts int
 }
 
+// Conv returns the conversation managed by this loop. Used by callers that need
+// to apply turn marks or inspect conversation state after execution.
+func (l *Loop) Conv() *Conversation { return l.conv }
+
+// checkInterrupt checks if the Interrupt or Abort signals are pending.
+// If Interrupt is pending, it waits for Resume or ctx cancellation, then returns false.
+// If Abort is pending, it returns true (caller should stop).
+// Returns true if the loop should stop.
+func (l *Loop) checkInterrupt(ctx context.Context) bool {
+	ctrl := l.cfg.Control
+	if ctrl == nil {
+		return false
+	}
+
+	// Non-blocking check for Abort first (highest priority).
+	select {
+	case <-ctrl.Abort:
+		slog.Info("loop: abort signal received", "agent", l.cfg.Model)
+		return true
+	default:
+	}
+
+	// Non-blocking check for Interrupt.
+	select {
+	case <-ctrl.Interrupt:
+		slog.Info("loop: interrupt signal received — pausing", "agent", l.cfg.Model)
+		if l.cfg.EventStream != nil {
+			l.cfg.EventStream.Emit(StreamEvent{
+				Kind:      EventError,
+				AgentName: l.cfg.Model,
+				SessionID: l.cfg.SessionID,
+				Message:   "paused: waiting for resume",
+			})
+		}
+		// Wait for Resume or ctx cancellation.
+		select {
+		case <-ctrl.Resume:
+			slog.Info("loop: resumed", "agent", l.cfg.Model)
+			return false
+		case <-ctrl.Abort:
+			slog.Info("loop: aborted while paused", "agent", l.cfg.Model)
+			return true
+		case <-ctx.Done():
+			return true
+		}
+	default:
+		return false
+	}
+}
+
+// drainSteer drains all pending messages from SteerCh and injects each as a
+// user turn in the conversation. This is called between tool-call batches so
+// the user can redirect the agent without restarting.
+func (l *Loop) drainSteer() {
+	if l.cfg.SteerCh == nil {
+		return
+	}
+	for {
+		select {
+		case msg, ok := <-l.cfg.SteerCh:
+			if !ok {
+				return
+			}
+			if msg != "" {
+				l.conv.AddUser(msg)
+				slog.Info("loop: steering message injected", "agent", l.cfg.Model)
+				if l.cfg.EventStream != nil {
+					l.cfg.EventStream.Emit(StreamEvent{
+						Kind:      EventTurnStart,
+						AgentName: l.cfg.Model,
+						SessionID: l.cfg.SessionID,
+						Message:   "[steering] " + msg,
+					})
+				}
+			}
+		default:
+			return
+		}
+	}
+}
+
 // NewLoop creates a new agentic loop.
 func NewLoop(cfg LoopConfig) *Loop {
+	// Apply phase budget overrides if a current phase is set.
+	if cfg.CurrentPhase != "" && len(cfg.PhaseBudgets) > 0 {
+		if budget, ok := cfg.PhaseBudgets[cfg.CurrentPhase]; ok {
+			if budget.MaxTokens > 0 {
+				cfg.MaxTokens = budget.MaxTokens
+			}
+			if budget.MaxTurns > 0 {
+				cfg.MaxTurns = budget.MaxTurns
+			}
+			if budget.Model != "" {
+				cfg.Model = budget.Model
+			}
+		}
+	}
 	if cfg.MaxTurns <= 0 {
 		cfg.MaxTurns = defaultMaxTurns
 	}
@@ -227,11 +416,21 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 		// Fire before_model_call hook.
 		l.cfg.Hooks.RunBeforeModelCall(l.cfg.System, l.cfg.Model, turnCount)
 
-		// Use streaming when available and delta callback is set
-		if sp, ok := l.cfg.Provider.(provider.StreamProvider); ok && l.cfg.OnTextDelta != nil {
+		// Use streaming when available and delta callback or EventStream is configured.
+		if sp, ok := l.cfg.Provider.(provider.StreamProvider); ok && (l.cfg.OnTextDelta != nil || l.cfg.EventStream != nil) {
 			resp, err = sp.ChatStream(ctx, chatReq, func(event provider.StreamEvent) {
-				if event.Type == "text_delta" && l.cfg.OnTextDelta != nil {
-					l.cfg.OnTextDelta(event.TextDelta)
+				if event.Type == "text_delta" {
+					if l.cfg.OnTextDelta != nil {
+						l.cfg.OnTextDelta(event.TextDelta)
+					}
+					if l.cfg.EventStream != nil {
+						l.cfg.EventStream.Emit(StreamEvent{
+							Kind:      EventTurnStart,
+							AgentName: l.cfg.Model,
+							SessionID: l.cfg.SessionID,
+							Message:   event.TextDelta,
+						})
+					}
 				}
 			})
 		} else {
@@ -241,6 +440,38 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 			if errors.Is(err, context.DeadlineExceeded) && l.cfg.MaxConsecutiveTimeouts > 0 {
 				l.consecutiveTimeouts++
 				if l.consecutiveTimeouts >= l.cfg.MaxConsecutiveTimeouts {
+					// Suspend if a channel is wired; otherwise abort.
+					if l.cfg.SuspendCh != nil && l.cfg.ResumeCh != nil {
+						cpID := ""
+						if l.cfg.Checkpoint != nil {
+							_ = l.cfg.Checkpoint.RecordSuspend(checkpoint.SuspendReasonError)
+							cpID, _ = l.cfg.Checkpoint.CreateCheckpoint("auto-suspend", nil)
+						}
+						sig := SuspendSignal{
+							CheckpointID: cpID,
+							Reason:       checkpoint.SuspendReasonError,
+							Preview:      fmt.Sprintf("Stuck after %d consecutive timeouts. Provide guidance to continue.", l.cfg.MaxConsecutiveTimeouts),
+						}
+						select {
+						case l.cfg.SuspendCh <- sig:
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						}
+						select {
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						case humanInput, ok := <-l.cfg.ResumeCh:
+							if !ok {
+								return nil, fmt.Errorf("resume channel closed during suspend")
+							}
+							if l.cfg.Checkpoint != nil {
+								_ = l.cfg.Checkpoint.RecordResume(humanInput)
+							}
+							l.conv.AddUser("[Human guidance]: " + humanInput)
+							l.consecutiveTimeouts = 0
+							continue
+						}
+					}
 					return nil, fmt.Errorf("chat turn %d: %d consecutive timeouts — aborting: %w",
 						turnCount, l.consecutiveTimeouts, err)
 				}
@@ -260,12 +491,31 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 		totalTokens.CacheReadTokens += resp.TokensUsed.CacheReadTokens
 		totalTokens.CacheWriteTokens += resp.TokensUsed.CacheWriteTokens
 
+		// Extract inline summary before displaying content to the user.
+		if l.cfg.InlineSummary && resp.Message.Content != "" {
+			if summaryText, cleaned := ExtractInlineSummary(resp.Message.Content); summaryText != "" {
+				resp.Message.Content = cleaned
+				if l.cfg.OnTurnSummary != nil {
+					l.cfg.OnTurnSummary(turnCount-1, summaryText)
+				}
+			}
+		}
+
 		// Add assistant message to history
 		l.conv.AddAssistant(resp.Message)
 
 		// Fire text callback for any text content
 		if resp.Message.Content != "" && l.cfg.OnText != nil {
 			l.cfg.OnText(resp.Message.Content)
+		}
+		if resp.Message.Content != "" && l.cfg.EventStream != nil {
+			l.cfg.EventStream.Emit(StreamEvent{
+				Kind:      EventTurnEnd,
+				AgentName: l.cfg.Model,
+				SessionID: l.cfg.SessionID,
+				Message:   resp.Message.Content,
+				Step:      turnCount,
+			})
 		}
 
 		// Record assistant message for checkpoint.
@@ -315,6 +565,14 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 				"model", l.cfg.Model,
 			)
 			l.cfg.Hooks.RunOnAgentDone(l.cfg.System, turnCount, "")
+			if l.cfg.EventStream != nil {
+				l.cfg.EventStream.Emit(StreamEvent{
+					Kind:      EventDone,
+					AgentName: l.cfg.Model,
+					SessionID: l.cfg.SessionID,
+					Step:      turnCount,
+				})
+			}
 			return &LoopResult{
 				FinalText:         resp.Message.Content,
 				TurnCount:         turnCount,
@@ -331,6 +589,16 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 
 			if l.cfg.OnToolCall != nil {
 				l.cfg.OnToolCall(tc)
+			}
+			if l.cfg.EventStream != nil {
+				l.cfg.EventStream.Emit(StreamEvent{
+					Kind:      EventToolCall,
+					AgentName: l.cfg.Model,
+					SessionID: l.cfg.SessionID,
+					ToolName:  tc.Name,
+					ToolInput: string(tc.Input),
+					Step:      turnCount,
+				})
 			}
 
 			// Record tool call event for checkpoint time-travel.
@@ -378,6 +646,30 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 
 			if l.cfg.OnToolResult != nil {
 				l.cfg.OnToolResult(tc.ID, tc.Name, result.Content, result.IsError)
+			}
+			if l.cfg.EventStream != nil {
+				l.cfg.EventStream.Emit(StreamEvent{
+					Kind:       EventToolResult,
+					AgentName:  l.cfg.Model,
+					SessionID:  l.cfg.SessionID,
+					ToolName:   tc.Name,
+					ToolOutput: result.Content,
+					Step:       turnCount,
+				})
+			}
+		}
+
+		// Real-time steering: inject any pending user guidance before next LLM call.
+		l.drainSteer()
+
+		// Granular interrupt: pause cleanly if Interrupt fired, wait for Resume.
+		if l.cfg.Control != nil {
+			if interrupted := l.checkInterrupt(ctx); interrupted {
+				return &LoopResult{
+					TurnCount:  turnCount,
+					TokensUsed: totalTokens,
+					Metrics:    metrics,
+				}, fmt.Errorf("loop interrupted")
 			}
 		}
 

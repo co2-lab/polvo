@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,6 +35,11 @@ var providerDefs = []providerDef{
 	{id: "mistral", label: "Mistral AI", providerType: "mistral", needsAPIKey: true, defaultModel: "mistral-large-latest", apiKeyHint: "console.mistral.ai"},
 	{id: "openrouter", label: "OpenRouter", providerType: "openrouter", needsAPIKey: true, defaultModel: "anthropic/claude-3.5-sonnet", apiKeyHint: "openrouter.ai"},
 	{id: "xai", label: "xAI (Grok)", providerType: "xai", needsAPIKey: true, defaultModel: "grok-3", apiKeyHint: "console.x.ai"},
+	{id: "glm", label: "GLM (Zhipu AI)", providerType: "glm", needsAPIKey: true, defaultModel: "glm-4-flash", apiKeyHint: "open.bigmodel.cn"},
+	{id: "minimax", label: "MiniMax", providerType: "minimax", needsAPIKey: true, defaultModel: "abab6.5s-chat", apiKeyHint: "platform.minimaxi.com"},
+	{id: "kimi", label: "Kimi (Moonshot)", providerType: "kimi", needsAPIKey: true, defaultModel: "moonshot-v1-8k", apiKeyHint: "platform.moonshot.cn"},
+	{id: "litellm", label: "LiteLLM (200+ models proxy)", providerType: "openai-compatible", needsAPIKey: false, needsBaseURL: true, defaultModel: "gpt-4o"},
+	{id: "openai-compatible", label: "OpenAI-compatible (custom)", providerType: "openai-compatible", needsAPIKey: true, needsBaseURL: true, defaultModel: "gpt-4o"},
 	{id: "ollama", label: "Ollama (Local)", providerType: "ollama", needsAPIKey: false, needsBaseURL: true, defaultModel: "llama3.2"},
 }
 
@@ -112,7 +118,24 @@ func runSetupWizard(firstTime bool) (map[string]any, error) {
 	if pdef.needsBaseURL {
 		fmt.Printf("\n%s\n", bold(fmt.Sprintf("Step %d:", step)))
 		step++
-		baseURL, _ = ask(r, "URL", "Ollama API URL", "http://localhost:11434")
+		defaultURL := "http://localhost:11434"
+		urlHint := "Ollama API URL"
+		if pdef.id == "litellm" {
+			defaultURL = "http://localhost:4000/v1"
+			urlHint = "LiteLLM proxy URL"
+			if isLiteLLMRunning() {
+				fmt.Printf("  %s\n", "\033[32m✓ LiteLLM detected at localhost:4000\033[0m")
+			} else {
+				fmt.Printf("  %s\n", dim("LiteLLM not detected. Start it with:"))
+				fmt.Printf("  %s\n", dim("  pip install litellm && litellm --model ollama/llama3"))
+				fmt.Printf("  %s\n", dim("  or: litellm --config litellm_config.yaml"))
+				fmt.Printf("  %s\n", dim("  Docs: docs.litellm.ai/docs/proxy/quick_start"))
+			}
+		} else if pdef.providerType == "openai-compatible" {
+			defaultURL = ""
+			urlHint = "Base URL (e.g. https://api.example.com/v1)"
+		}
+		baseURL, _ = ask(r, "Base URL", urlHint, defaultURL)
 	}
 
 	fmt.Printf("\n%s\n", bold(fmt.Sprintf("Step %d:", step)))
@@ -132,7 +155,19 @@ func runSetupWizard(firstTime bool) (map[string]any, error) {
 
 	cfgPath := config.UserConfigPath()
 	_ = os.MkdirAll(filepath.Dir(cfgPath), 0o700)
-	cfgMap := map[string]any{"providers": map[string]any{alias: providerEntry}}
+
+	// Merge into existing config so we don't overwrite other providers.
+	cfgMap := map[string]any{}
+	if existing, err := os.ReadFile(cfgPath); err == nil {
+		_ = yaml.Unmarshal(existing, &cfgMap)
+	}
+	providers, _ := cfgMap["providers"].(map[string]any)
+	if providers == nil {
+		providers = map[string]any{}
+	}
+	providers[alias] = providerEntry
+	cfgMap["providers"] = providers
+
 	out, _ := yaml.Marshal(cfgMap)
 	_ = os.WriteFile(cfgPath, out, 0o600)
 
@@ -153,8 +188,10 @@ func pickModelDynamic(r *bufio.Reader, pdef providerDef, apiKey, baseURL string)
 	}
 
 	labels := make([]string, len(models)+1)
+	details := make([]string, len(models)+1)
 	for i, m := range models {
 		labels[i] = m.ID
+		details[i] = modelDetail(m)
 	}
 	labels[len(models)] = "⌨  Custom model…"
 
@@ -166,7 +203,7 @@ func pickModelDynamic(r *bufio.Reader, pdef providerDef, apiKey, baseURL string)
 		}
 	}
 
-	idx, err := arrowSelect("Choose Model", labels, defaultIdx)
+	idx, err := arrowSelectWithDetails("Choose Model", labels, details, defaultIdx)
 	if err != nil {
 		return "", err
 	}
@@ -200,6 +237,14 @@ func fetchModels(ctx context.Context, pdef providerDef, apiKey, baseURL string) 
 		p = provider.NewOpenRouter(pdef.id, apiKey, pdef.defaultModel)
 	case "xai":
 		p = provider.NewXAI(pdef.id, apiKey, pdef.defaultModel)
+	case "glm":
+		p = provider.NewGLM(pdef.id, apiKey, pdef.defaultModel)
+	case "minimax":
+		p = provider.NewMiniMax(pdef.id, apiKey, pdef.defaultModel)
+	case "kimi":
+		p = provider.NewKimi(pdef.id, apiKey, pdef.defaultModel)
+	case "openai-compatible":
+		p = provider.NewOpenAI(pdef.id, apiKey, baseURL, pdef.defaultModel)
 	case "ollama":
 		base := baseURL
 		if base == "" {
@@ -210,6 +255,50 @@ func fetchModels(ctx context.Context, pdef providerDef, apiKey, baseURL string) 
 		return nil, fmt.Errorf("unsupported")
 	}
 	return p.ListModels(ctx)
+}
+
+// modelDetail returns a compact one-line string with benchmark scores for a model.
+// Empty string when no scores are known.
+func modelDetail(m provider.ModelInfo) string {
+	var parts []string
+	if m.SWEScore > 0 {
+		parts = append(parts, fmt.Sprintf("SWE %.0f%%", m.SWEScore))
+	}
+	if m.LCBScore > 0 {
+		parts = append(parts, fmt.Sprintf("LCB %.0f%%", m.LCBScore))
+	}
+	if m.IOIScore > 0 {
+		parts = append(parts, fmt.Sprintf("IOI %.0f%%", m.IOIScore))
+	}
+	if m.ContextWindow > 0 {
+		ctx := m.ContextWindow
+		switch {
+		case ctx >= 1_000_000:
+			parts = append(parts, fmt.Sprintf("%dM ctx", ctx/1_000_000))
+		case ctx >= 1_000:
+			parts = append(parts, fmt.Sprintf("%dk ctx", ctx/1_000))
+		default:
+			parts = append(parts, fmt.Sprintf("%d ctx", ctx))
+		}
+	}
+	if m.PricingInput > 0 {
+		parts = append(parts, fmt.Sprintf("$%.2f/M in", m.PricingInput))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, " · ")
+}
+
+// isLiteLLMRunning probes localhost:4000 to check if a LiteLLM proxy is up.
+func isLiteLLMRunning() bool {
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	resp, err := client.Get("http://localhost:4000/health")
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode < 500
 }
 
 func stripANSI(s string) string {

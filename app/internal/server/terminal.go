@@ -6,8 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -17,8 +19,8 @@ import (
 
 // session holds a running PTY process and its scrollback buffer.
 type session struct {
-	mu       sync.Mutex
-	ptmx     *os.File
+	mu         sync.Mutex
+	ptmx       *os.File
 	scrollback []byte
 }
 
@@ -79,7 +81,7 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 		return conn.Write(ctx, websocket.MessageBinary, msg)
 	}
 
-	// Resume existing session if PTY is still alive
+	// Resume existing session if PTY is still alive.
 	if sess, ok := s.term.get(id); ok {
 		sess.mu.Lock()
 		sb := make([]byte, len(sess.scrollback))
@@ -100,7 +102,21 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 	}
 	var cmd *exec.Cmd
 	if cmdArg != "" {
-		cmd = exec.CommandContext(ctx, cmdArg)
+		// Resolve the executable: prefer PATH lookup, fall back to the running
+		// binary itself when the name matches (e.g. "polvo" inside the sidecar
+		// where PATH may not include the install directory).
+		resolved := cmdArg
+		if _, err := exec.LookPath(cmdArg); err != nil {
+			if self, serr := os.Executable(); serr == nil {
+				base := filepath.Base(self)
+				// Handle Tauri sidecars which often have target triple suffixes
+				if base == cmdArg || base == cmdArg+".exe" || strings.HasPrefix(base, cmdArg+"-") {
+					resolved = self
+				}
+			}
+		}
+		slog.Info("terminal: starting executable", "cmd", cmdArg, "resolved", resolved, "id", id)
+		cmd = exec.CommandContext(ctx, resolved)
 	} else {
 		cmd = exec.CommandContext(ctx, shell)
 	}
@@ -112,10 +128,20 @@ func (s *Server) handleTerminalWS(w http.ResponseWriter, r *http.Request) {
 			filteredEnv = append(filteredEnv, e)
 		}
 	}
-	cmd.Env = append(filteredEnv, "TERM=xterm-256color")
+	termType := "xterm-256color"
+	if cmdArg != "" {
+		// Use screen prefix to skip termenv's background color query (which hangs for 5s in PTYs)
+		termType = "screen-256color"
+	}
+	env := append(filteredEnv, "TERM="+termType)
+	if cmdArg != "" {
+		env = append(env, "POLVO_EMBEDDED=1")
+	}
+	cmd.Env = env
 
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
+		slog.Error("terminal: pty.Start failed", "cmd", cmd.Path, "err", err)
 		return
 	}
 

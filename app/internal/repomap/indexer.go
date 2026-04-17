@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,8 +60,18 @@ func (ix *Indexer) IndexAll(ctx context.Context) error {
 }
 
 // IndexFile chunks a single file and upserts changed chunks into the index.
+// Also regenerates the .symbols sidecar if the file content changed.
 func (ix *Indexer) IndexFile(path string) error {
 	return ix.indexFileAt(path)
+}
+
+// RemoveFile removes the .symbols sidecar and all chunks for the given path.
+func (ix *Indexer) RemoveFile(path string) error {
+	// Best-effort sidecar removal.
+	if err := os.Remove(sidecarPath(path)); err != nil && !os.IsNotExist(err) {
+		slog.Warn("repomap: remove sidecar", "path", path, "err", err)
+	}
+	return ix.index.DeleteByPath(path)
 }
 
 // indexFileAt is the shared implementation used by IndexAll and IndexFile.
@@ -93,11 +104,20 @@ func (ix *Indexer) indexFileAt(path string) error {
 	if err != nil {
 		return fmt.Errorf("chunking %s: %w", path, err)
 	}
-	if len(chunks) == 0 {
-		return nil
+	if len(chunks) > 0 {
+		if err := ix.index.UpsertBatch(chunks); err != nil {
+			return err
+		}
 	}
 
-	return ix.index.UpsertBatch(chunks)
+	// Generate .symbols sidecar — non-fatal if it fails.
+	if syms := ExtractSymbols(path, content); syms != nil {
+		if wErr := writeSidecar(path, fh, syms); wErr != nil {
+			slog.Warn("repomap: write sidecar", "path", path, "err", wErr)
+		}
+	}
+
+	return nil
 }
 
 // cleanPath returns a cleaned absolute path.

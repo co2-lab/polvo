@@ -29,11 +29,14 @@ var secretPatterns = []secretPattern{
 	{regexp.MustCompile(`SG\.[A-Za-z0-9_-]{22,}\.[A-Za-z0-9_-]{43,}`), "[SENDGRID_KEY_REDACTED]"},
 	{regexp.MustCompile(`(?i)(?:secret|private_key)\s*[=:]\s*\S{8,}`), "[SECRET_REDACTED]"},
 	// Key/value assignment patterns.
-	{regexp.MustCompile(`(?i)(aws_access_key_id|aws_secret_access_key)\s*[=:]\s*\S+`), "[AWS_KEY_REDACTED]"},
-	{regexp.MustCompile(`(?i)(api[_-]?key|apikey|api[_-]?secret)\s*[=:]\s*\S+`), "[API_KEY_REDACTED]"},
+	// Require a non-letter before the key name so camelCase identifiers like
+	// "needsAPIKey" or "apiKeyHint" don't match. Values must be ≥8 chars.
+	{regexp.MustCompile(`(?i)(?:^|[^A-Za-z])(aws_access_key_id|aws_secret_access_key)\s*[=:]\s*\S+`), "[AWS_KEY_REDACTED]"},
+	// Also match plain "apikey" (no separator) with the same word-boundary guard.
+	{regexp.MustCompile(`(?i)(?:^|[^A-Za-z])(api[_-]?key|api[_-]?secret)\s*[=:]\s*\S{5,}`), "[API_KEY_REDACTED]"},
 	{regexp.MustCompile(`(?i)(token|bearer)\s*[=:]\s*[A-Za-z0-9._\-]{20,}`), "[TOKEN_REDACTED]"},
 	{regexp.MustCompile(`(?i)authorization\s*[=:]\s*\S+`), "[AUTH_REDACTED]"},
-	{regexp.MustCompile(`(?i)(password|passwd|pwd)\s*[=:]\s*\S+`), "[PASSWORD_REDACTED]"},
+	{regexp.MustCompile(`(?i)(?:^|[^A-Za-z])(password|passwd|pwd)\s*[=:]\s*\S{5,}`), "[PASSWORD_REDACTED]"},
 }
 
 // MaskResult holds the masked content and details of what was redacted.

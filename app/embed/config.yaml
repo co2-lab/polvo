@@ -53,3 +53,11 @@ settings:
   report_dir: ".polvo/reports"
   log_level: "info"
   max_parallel: 2
+
+hooks:
+  pre_commit:
+    enabled: true
+    check_polvo_yaml: true
+    secrets_scan: true
+    secrets_scan_ignore: []
+    ai_scan: false

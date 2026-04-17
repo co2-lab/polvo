@@ -21,7 +21,8 @@
         "fullscreen": false,
         "decorations": true,
         "titleBarStyle": "Overlay",
-        "devtools": true
+        "devtools": true,
+        "hiddenTitle": true
       }
     ],
     "security": {

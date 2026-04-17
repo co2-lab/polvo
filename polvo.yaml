@@ -1,6 +1,11 @@
 project:
   name: polvo
   color: '#8b5cf6'
+hooks:
+  pre_commit:
+    secrets_scan_ignore:
+      - "**/testdata/**"
+      - "**/*.symbols"
 interfaces:
   init:
     patterns:

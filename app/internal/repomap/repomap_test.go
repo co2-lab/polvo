@@ -40,65 +40,43 @@ func TestEstimateTokens(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// extractSymbolLine
+// ExtractSymbols (replaces extractSymbolLine tests)
 // ---------------------------------------------------------------------------
 
-func TestExtractSymbolLine_Go(t *testing.T) {
-	cases := []struct {
-		line       string
-		wantSymbol string
-	}{
-		{"func MyFunc()", "MyFunc"},
-		{"func myPrivate()", ""},       // not exported
-		{"type MyType struct", "MyType"},
-		{"var MyVar =", "MyVar"},
-		{"const MyConst =", "MyConst"},
-		{"// func NotAFunc", ""},       // comment
+func TestExtractSymbols_Go(t *testing.T) {
+	src := []byte("package p\nfunc MyFunc() {}\nfunc myPrivate() {}\ntype MyType struct{}\nvar MyVar = 1\nconst MyConst = 2\n")
+	syms := ExtractSymbols("foo.go", src)
+	want := []string{"MyFunc", "MyType", "MyVar", "MyConst"}
+	if len(syms) != len(want) {
+		t.Fatalf("want %d symbols, got %d: %+v", len(want), len(syms), syms)
 	}
-	for _, tc := range cases {
-		got := extractSymbolLine(tc.line, ".go")
-		if got != tc.wantSymbol {
-			t.Errorf("extractSymbolLine(%q, .go) = %q, want %q", tc.line, got, tc.wantSymbol)
+	for i, s := range syms {
+		name := firstIdent(s.Signature[len(s.Kind)+1:])
+		if name != want[i] {
+			t.Errorf("[%d] want %q got %q", i, want[i], name)
 		}
 	}
 }
 
-func TestExtractSymbolLine_TypeScript(t *testing.T) {
-	cases := []struct {
-		line       string
-		wantSymbol string
-	}{
-		{"export function MyFn(", "MyFn"},
-		{"export class MyClass", "MyClass"},
-		{"export interface IFoo", "IFoo"},
-		{"export const bar =", "bar"},
-		{"function local()", ""},  // no export prefix
+func TestExtractSymbols_TypeScript(t *testing.T) {
+	src := []byte("export function MyFn(x: number) {}\nexport class MyClass {}\nexport interface IFoo {}\nexport const bar = () => {}\nfunction local() {}\n")
+	syms := ExtractSymbols("foo.ts", src)
+	if len(syms) < 4 {
+		t.Fatalf("want at least 4 symbols, got %d: %+v", len(syms), syms)
 	}
-	for _, tc := range cases {
-		got := extractSymbolLine(tc.line, ".ts")
-		if got != tc.wantSymbol {
-			t.Errorf("extractSymbolLine(%q, .ts) = %q, want %q", tc.line, got, tc.wantSymbol)
+	// "local" should NOT be in syms
+	for _, s := range syms {
+		if strings.Contains(s.Signature, "local") {
+			t.Errorf("non-exported 'local' should not appear: %+v", s)
 		}
 	}
 }
 
-func TestExtractSymbolLine_Python(t *testing.T) {
-	cases := []struct {
-		line       string
-		wantSymbol string
-	}{
-		{"def my_function(", "my_function"},
-		{"class MyClass:", "MyClass"},
-		// indented line — extractSymbolLine receives already-trimmed line from extractSymbols
-		// "    def indented(" after TrimSpace becomes "def indented(" → returns "indented"
-		// So we test extractSymbolLine directly with already-trimmed input:
-		{"def indented(", "indented"},
-	}
-	for _, tc := range cases {
-		got := extractSymbolLine(tc.line, ".py")
-		if got != tc.wantSymbol {
-			t.Errorf("extractSymbolLine(%q, .py) = %q, want %q", tc.line, got, tc.wantSymbol)
-		}
+func TestExtractSymbols_Python(t *testing.T) {
+	src := []byte("def my_function(x):\n    pass\nclass MyClass:\n    pass\ndef _private():\n    pass\n")
+	syms := ExtractSymbols("foo.py", src)
+	if len(syms) != 2 {
+		t.Fatalf("want 2 symbols (my_function, MyClass), got %d: %+v", len(syms), syms)
 	}
 }
 

@@ -6,10 +6,10 @@ import '@xterm/xterm/css/xterm.css'
 import { useIDEStore } from '../../store/useIDEStore'
 
 // Protocol: first byte of every binary WebSocket frame
-const MSG_INPUT   = 0x00 // client → server: raw stdin bytes
-const MSG_OUTPUT  = 0x01 // server → client: raw PTY output bytes
-const MSG_RESIZE  = 0x02 // client → server: JSON {cols, rows}
-const MSG_NEW     = 0x03 // server → client: session is brand new
+const MSG_INPUT = 0x00 // client → server: raw stdin bytes
+const MSG_OUTPUT = 0x01 // server → client: raw PTY output bytes
+const MSG_RESIZE = 0x02 // client → server: JSON {cols, rows}
+const MSG_NEW = 0x03 // server → client: session is brand new
 const MSG_RESUMED = 0x04 // server → client: session resumed (scrollback replayed)
 
 interface TerminalPanelProps {
@@ -26,10 +26,11 @@ export function TerminalPanel({ sessionId = 'default', executable }: TerminalPan
 
   // Apply font changes to xterm without recreating the terminal
   useEffect(() => {
-    if (!termRef.current) return
-    termRef.current.options.fontFamily = editorFontFamily
-    termRef.current.options.fontSize = editorFontSize
-    fitAddonRef.current?.fit()
+    if (termRef.current) {
+      termRef.current.options.fontFamily = editorFontFamily
+      termRef.current.options.fontSize = editorFontSize
+      fitAddonRef.current?.fit()
+    }
   }, [editorFontFamily, editorFontSize])
 
   useEffect(() => {
@@ -45,11 +46,10 @@ export function TerminalPanel({ sessionId = 'default', executable }: TerminalPan
     let destroyed = false
     let retryTimer: ReturnType<typeof setTimeout> | null = null
 
-    const { editorFontFamily: fontFamily, editorFontSize: fontSize } = useIDEStore.getState().generalSettings
     const term = new Terminal({
       cursorBlink: true,
-      fontSize,
-      fontFamily,
+      fontSize: editorFontSize,
+      fontFamily: editorFontFamily,
       theme: {
         background: '#000000',
         foreground: '#e0e0e0',
@@ -106,7 +106,7 @@ export function TerminalPanel({ sessionId = 'default', executable }: TerminalPan
         fitAddon.fit()
       }
 
-      ws.onmessage = (e) => {
+      ws.onmessage = e => {
         const buf = new Uint8Array(e.data as ArrayBuffer)
         if (buf.length === 0) return
         switch (buf[0]) {
@@ -129,7 +129,7 @@ export function TerminalPanel({ sessionId = 'default', executable }: TerminalPan
         // handled by onclose — avoid double retry
       }
 
-      ws.onclose = (e) => {
+      ws.onclose = e => {
         if (destroyed) return
         // e.code 1000 = normal close (we called ws.close()), don't retry
         if (e.code === 1000) return
@@ -139,9 +139,12 @@ export function TerminalPanel({ sessionId = 'default', executable }: TerminalPan
       }
     }
 
-    connect(0)
+    // Small delay before connecting — prevents the React StrictMode double-invoke
+    // from firing two WS connections in rapid succession (first is closed immediately
+    // with code 1000 before it can upgrade, causing a harmless but noisy console error).
+    const connectTimer = setTimeout(() => connect(0), 50)
 
-    term.onData((data) => {
+    term.onData(data => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return
       const bytes = new TextEncoder().encode(data)
       const msg = new Uint8Array(1 + bytes.length)
@@ -157,14 +160,15 @@ export function TerminalPanel({ sessionId = 'default', executable }: TerminalPan
 
     return () => {
       destroyed = true
+      clearTimeout(connectTimer)
       if (retryTimer) clearTimeout(retryTimer)
-      if (ws) ws.close()
+      if (ws) ws.close(1000, 'component unmounted')
       ro.disconnect()
       term.dispose()
       termRef.current = null
       fitAddonRef.current = null
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   return (

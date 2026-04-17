@@ -523,6 +523,191 @@ func TestSummarizeKeepTail(t *testing.T) {
 	})
 }
 
+// ---- AmortizedCondenser -----------------------------------------------------
+
+func TestAmortizedCondenser(t *testing.T) {
+	t.Run("len <= MaxSize não modifica", func(t *testing.T) {
+		c := &AmortizedCondenser{MaxSize: 10}
+		input := msgs(10)
+		got, err := c.Condense(context.Background(), input, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != len(input) {
+			t.Errorf("expected unchanged len=%d, got %d", len(input), len(got))
+		}
+	})
+
+	t.Run("len > MaxSize retorna head+tail sem LLM", func(t *testing.T) {
+		c := &AmortizedCondenser{MaxSize: 10, KeepFirst: 2}
+		input := msgs(20)
+		got, err := c.Condense(context.Background(), input, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// head(2) + tail(MaxSize/2=5) = 7
+		expected := 2 + 10/2
+		if len(got) != expected {
+			t.Errorf("expected len=%d, got %d", expected, len(got))
+		}
+	})
+
+	t.Run("primeiras KeepFirst mensagens preservadas na ordem", func(t *testing.T) {
+		c := &AmortizedCondenser{MaxSize: 10, KeepFirst: 3}
+		input := msgs(20)
+		input[0].Content = "FIRST"
+		input[1].Content = "SECOND"
+		input[2].Content = "THIRD"
+		got, _ := c.Condense(context.Background(), input, 0)
+		if got[0].Content != "FIRST" || got[1].Content != "SECOND" || got[2].Content != "THIRD" {
+			t.Error("first KeepFirst messages not preserved in order")
+		}
+	})
+
+	t.Run("últimas MaxSize/2 mensagens preservadas na ordem", func(t *testing.T) {
+		c := &AmortizedCondenser{MaxSize: 10, KeepFirst: 2}
+		input := msgs(20)
+		// Mark the last 5 messages
+		for i := 15; i < 20; i++ {
+			input[i].Content = "TAIL"
+		}
+		got, _ := c.Condense(context.Background(), input, 0)
+		for _, m := range got[2:] { // skip head
+			if m.Content != "TAIL" {
+				t.Errorf("expected tail message 'TAIL', got %q", m.Content)
+			}
+		}
+	})
+
+	t.Run("defaults aplicados quando campos zero", func(t *testing.T) {
+		c := &AmortizedCondenser{} // MaxSize=60, KeepFirst=2
+		input := msgs(30)          // below default MaxSize=60, should not condense
+		got, _ := c.Condense(context.Background(), input, 0)
+		if len(got) != len(input) {
+			t.Errorf("expected no condensation for len=30 < MaxSize=60, got %d", len(got))
+		}
+	})
+
+	t.Run("condensação de 100 msgs com defaults", func(t *testing.T) {
+		c := &AmortizedCondenser{} // MaxSize=60, KeepFirst=2
+		input := msgs(100)         // above default MaxSize=60
+		got, _ := c.Condense(context.Background(), input, 0)
+		expected := 2 + 60/2 // head(2) + tail(30) = 32
+		if len(got) != expected {
+			t.Errorf("expected %d messages, got %d", expected, len(got))
+		}
+	})
+}
+
+// ---- PipelineCondenser -------------------------------------------------------
+
+func TestPipelineCondenser(t *testing.T) {
+	t.Run("primeiro stage que reduz: stages seguintes não chamados", func(t *testing.T) {
+		calls := make([]int, 3)
+		stages := []Condenser{
+			&testCondenser{fn: func(messages []provider.Message) ([]provider.Message, error) {
+				calls[0]++
+				return messages[:1], nil // reduz
+			}},
+			&testCondenser{fn: func(messages []provider.Message) ([]provider.Message, error) {
+				calls[1]++
+				return messages[:1], nil
+			}},
+			&testCondenser{fn: func(messages []provider.Message) ([]provider.Message, error) {
+				calls[2]++
+				return messages[:1], nil
+			}},
+		}
+		c := &PipelineCondenser{Stages: stages}
+		input := msgs(10)
+		got, err := c.Condense(context.Background(), input, 1000)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 1 {
+			t.Errorf("expected 1 message, got %d", len(got))
+		}
+		if calls[0] != 1 {
+			t.Errorf("expected stage 0 called once, got %d", calls[0])
+		}
+		if calls[1] != 0 {
+			t.Errorf("expected stage 1 not called, got %d calls", calls[1])
+		}
+		if calls[2] != 0 {
+			t.Errorf("expected stage 2 not called, got %d calls", calls[2])
+		}
+	})
+
+	t.Run("nenhum stage reduz: retorna original", func(t *testing.T) {
+		stages := []Condenser{
+			&testCondenser{fn: func(messages []provider.Message) ([]provider.Message, error) {
+				return messages, nil // não reduz
+			}},
+			&testCondenser{fn: func(messages []provider.Message) ([]provider.Message, error) {
+				return messages, nil // não reduz
+			}},
+		}
+		c := &PipelineCondenser{Stages: stages}
+		input := msgs(5)
+		got, err := c.Condense(context.Background(), input, 1000)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != len(input) {
+			t.Errorf("expected original len=%d, got %d", len(input), len(got))
+		}
+	})
+
+	t.Run("stage com erro: propaga erro, retorna mensagens originais", func(t *testing.T) {
+		stages := []Condenser{
+			&testCondenser{fn: func(messages []provider.Message) ([]provider.Message, error) {
+				return nil, errors.New("stage failed")
+			}},
+		}
+		c := &PipelineCondenser{Stages: stages}
+		input := msgs(5)
+		got, err := c.Condense(context.Background(), input, 1000)
+		if err == nil {
+			t.Error("expected error from failed stage")
+		}
+		if len(got) != len(input) {
+			t.Errorf("on error, expected original messages returned, got %d", len(got))
+		}
+	})
+
+	t.Run("pipeline vazio: retorna original", func(t *testing.T) {
+		c := &PipelineCondenser{Stages: nil}
+		input := msgs(5)
+		got, err := c.Condense(context.Background(), input, 1000)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != len(input) {
+			t.Errorf("empty pipeline should return original, got %d", len(got))
+		}
+	})
+
+	t.Run("segundo stage reduz quando primeiro não reduz", func(t *testing.T) {
+		stages := []Condenser{
+			&testCondenser{fn: func(messages []provider.Message) ([]provider.Message, error) {
+				return messages, nil // não reduz
+			}},
+			&testCondenser{fn: func(messages []provider.Message) ([]provider.Message, error) {
+				return messages[:2], nil // reduz
+			}},
+		}
+		c := &PipelineCondenser{Stages: stages}
+		input := msgs(10)
+		got, err := c.Condense(context.Background(), input, 1000)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 2 {
+			t.Errorf("expected 2 messages from second stage, got %d", len(got))
+		}
+	})
+}
+
 // testCondenser is a simple condenser for testing ApplyCondenser.
 type testCondenser struct {
 	fn func(messages []provider.Message) ([]provider.Message, error)

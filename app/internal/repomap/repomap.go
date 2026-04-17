@@ -1,24 +1,24 @@
 package repomap
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 // RepoMap builds a token-budgeted symbol map of the repository.
-// It uses a lightweight grep-based extractor (no tree-sitter dependency)
-// that works for Go, TypeScript, Python, and JavaScript.
-// A full tree-sitter integration can replace the extractor in a later phase.
+// It uses go/ast for Go files and improved regex for TS/JS/Python.
+// A PageRank graph over cross-file references ranks files by semantic importance.
 type RepoMap struct {
 	Root         string
 	MaxTokens    int      // default 2000
 	Refresh      string   // "auto" | "always" | "manual"
 	ExcludeFiles []string // files already in chat context — skip to avoid duplication
+	SymCache     *SymCache // optional SQLite symbol cache; nil = no caching
 }
 
 // New creates a RepoMap with defaults.
@@ -32,18 +32,25 @@ func New(root string, maxTokens int) *RepoMap {
 // fileSymbol represents a file and its extracted symbols.
 type fileSymbol struct {
 	Path    string
-	Symbols []string
-	Score   float64 // PageRank-like score
+	Symbols []Symbol // rich symbols (line+kind+signature)
+	Names   []string // plain names for score boosting
+	Score   float64  // PageRank-like score
+}
+
+// rankedTag is a (file, symbol-name) pair with a PageRank-derived score.
+type rankedTag struct {
+	RelPath string
+	Name    string
+	Score   float64
 }
 
 // Build generates the repo map as a formatted string within MaxTokens.
-// focusFiles are files relevant to the current task — they receive a score boost.
+// focusFiles are files relevant to the current task.
+// Uses go/ast extraction + PageRank cross-file ranking + binary-search budget fit.
 func (r *RepoMap) Build(_ context.Context, focusFiles []string) (string, error) {
-	focusSet := make(map[string]bool)
+	focusSet := make(map[string]bool, len(focusFiles))
 	for _, f := range focusFiles {
 		focusSet[filepath.Clean(f)] = true
-		// Also boost files in the same directory as focus files
-		focusSet[filepath.Dir(f)] = true
 	}
 
 	excludeSet := make(map[string]bool, len(r.ExcludeFiles))
@@ -51,8 +58,11 @@ func (r *RepoMap) Build(_ context.Context, focusFiles []string) (string, error) 
 		excludeSet[filepath.Clean(f)] = true
 	}
 
-	var files []fileSymbol
-	err := filepath.WalkDir(r.Root, func(path string, d os.DirEntry, err error) error {
+	// Phase 1: collect rich symbols per file.
+	fileSyms := make(map[string][]RichSymbol)  // relPath → symbols
+	legacySyms := make(map[string][]Symbol)     // relPath → legacy symbols (for rendering)
+
+	walkErr := filepath.WalkDir(r.Root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -65,113 +75,231 @@ func (r *RepoMap) Build(_ context.Context, focusFiles []string) (string, error) 
 		if !isSourceFile(d.Name()) {
 			return nil
 		}
-
-		// Skip files already in the active chat context.
 		if excludeSet[filepath.Clean(path)] {
 			return nil
 		}
 
-		syms, err := extractSymbols(path)
-		if err != nil || len(syms) == 0 {
-			return nil
-		}
-
-		score := 1.0
 		rel, _ := filepath.Rel(r.Root, path)
-		if focusSet[filepath.Clean(path)] || focusSet[filepath.Dir(path)] {
-			score = 10.0 // boost focus files
-		}
-		// Boost files that import/reference focus file names
-		for _, f := range focusFiles {
-			base := strings.TrimSuffix(filepath.Base(f), filepath.Ext(f))
-			if strings.Contains(strings.Join(syms, " "), base) {
-				score += 2.0
-			}
-		}
 
-		files = append(files, fileSymbol{Path: rel, Symbols: syms, Score: score})
-		return nil
-	})
-	if err != nil {
-		return "", fmt.Errorf("walking repo: %w", err)
-	}
-
-	// Sort by score descending, then path
-	sort.Slice(files, func(i, j int) bool {
-		if files[i].Score != files[j].Score {
-			return files[i].Score > files[j].Score
-		}
-		return files[i].Path < files[j].Path
-	})
-
-	// Build output within token budget
-	var sb strings.Builder
-	sb.WriteString("# Repository Map\n\n")
-	tokensSoFar := EstimateTokens(sb.String())
-
-	for _, f := range files {
-		line := fmt.Sprintf("%s: %s\n", f.Path, strings.Join(f.Symbols, ", "))
-		cost := EstimateTokens(line)
-		if tokensSoFar+cost > r.MaxTokens {
-			break
-		}
-		sb.WriteString(line)
-		tokensSoFar += cost
-	}
-
-	return sb.String(), nil
-}
-
-// extractSymbols pulls exported symbol names from a source file using
-// a simple line-scanner (no AST parsing needed for the map).
-func extractSymbols(path string) ([]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	ext := strings.ToLower(filepath.Ext(path))
-	var syms []string
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		sym := extractSymbolLine(line, ext)
-		if sym != "" {
-			syms = append(syms, sym)
-		}
-	}
-	return syms, scanner.Err()
-}
-
-// extractSymbolLine extracts a symbol name from a source line based on file extension.
-func extractSymbolLine(line, ext string) string {
-	switch ext {
-	case ".go":
-		for _, prefix := range []string{"func ", "type ", "var ", "const "} {
-			if strings.HasPrefix(line, prefix) {
-				rest := strings.TrimPrefix(line, prefix)
-				name := firstIdent(rest)
-				if name != "" && isExported(name) {
-					return name
+		// Try SymCache.
+		var richSyms []RichSymbol
+		if r.SymCache != nil {
+			info, statErr := os.Stat(path)
+			if statErr == nil {
+				mtime := info.ModTime().UnixNano()
+				cached, cacheErr := r.SymCache.Get(rel, mtime)
+				if cacheErr == nil && cached != nil {
+					richSyms = cached
 				}
 			}
 		}
-	case ".ts", ".tsx", ".js", ".jsx":
-		for _, prefix := range []string{"export function ", "export class ", "export interface ", "export type ", "export const ", "export default function "} {
-			if strings.HasPrefix(line, prefix) {
-				rest := strings.TrimPrefix(line, prefix)
-				return firstIdent(rest)
+
+		if richSyms == nil {
+			content, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return nil
 			}
+			richSyms = ExtractRichSymbols(rel, content)
+			if r.SymCache != nil {
+				info, statErr := os.Stat(path)
+				if statErr == nil {
+					_ = r.SymCache.Put(rel, info.ModTime().UnixNano(), richSyms)
+				}
+			}
+			// Also keep legacy symbol extraction for rendering.
+			legacySyms[rel] = extractLegacyFallback(rel, content)
 		}
-	case ".py":
-		if strings.HasPrefix(line, "def ") || strings.HasPrefix(line, "class ") {
-			rest := strings.TrimPrefix(strings.TrimPrefix(line, "def "), "class ")
-			return firstIdent(rest)
+
+		if richSyms != nil {
+			fileSyms[rel] = richSyms
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return "", fmt.Errorf("walking repo: %w", walkErr)
+	}
+
+	// Phase 2: build PageRank graph.
+	mentionedIdents := extractMentionedIdents(focusFiles)
+	g, pers := buildGraph(fileSyms, focusSet, mentionedIdents)
+	rank := pageRank(g, pers)
+
+	// Update cache with computed ranks (fire-and-forget).
+	if r.SymCache != nil {
+		go func() {
+			for path, r2 := range rank {
+				_ = r.SymCache.SetRank(path, r2)
+			}
+		}()
+	}
+
+	// Phase 3: distribute rank to (file, symbol) pairs.
+	scores := distributeRank(g, rank, fileSyms)
+
+	// Phase 4: collect ranked tags.
+	var tags []rankedTag
+	for key, score := range scores {
+		tags = append(tags, rankedTag{RelPath: key[0], Name: key[1], Score: score})
+	}
+	// Add files with legacy symbols that may not have rich defs (non-Go files etc).
+	for rel, syms := range legacySyms {
+		if _, ok := fileSyms[rel]; ok {
+			continue // already covered
+		}
+		fileRank := rank[rel]
+		for _, s := range syms {
+			tags = append(tags, rankedTag{RelPath: rel, Name: firstIdent(s.Signature), Score: fileRank})
 		}
 	}
-	return ""
+
+	// Sort: score desc, then relPath asc, then name asc (deterministic).
+	sort.Slice(tags, func(i, j int) bool {
+		if tags[i].Score != tags[j].Score {
+			return tags[i].Score > tags[j].Score
+		}
+		if tags[i].RelPath != tags[j].RelPath {
+			return tags[i].RelPath < tags[j].RelPath
+		}
+		return tags[i].Name < tags[j].Name
+	})
+
+	// Phase 5: binary-search token budget.
+	header := "# Repository Map\n\n"
+	result := r.fitToBudget(tags, fileSyms, legacySyms, focusSet, rank, header)
+	return result, nil
+}
+
+// fitToBudget uses binary search to find the largest prefix of rankedTags
+// that fits within MaxTokens (±15% tolerance matches Aider behaviour).
+func (r *RepoMap) fitToBudget(
+	tags []rankedTag,
+	fileSyms map[string][]RichSymbol,
+	legacySyms map[string][]Symbol,
+	focusSet map[string]bool,
+	rank map[string]float64,
+	header string,
+) string {
+	if len(tags) == 0 {
+		return header
+	}
+
+	budget := r.MaxTokens
+	tolerance := int(float64(budget) * 0.15)
+
+	// Group tags by file for rendering.
+	renderGroup := func(n int) string {
+		var sb strings.Builder
+		sb.WriteString(header)
+		// Collect files in order.
+		seen := make(map[string]bool)
+		fileOrder := make([]string, 0)
+		for i := 0; i < n && i < len(tags); i++ {
+			rel := tags[i].RelPath
+			if !seen[rel] {
+				seen[rel] = true
+				fileOrder = append(fileOrder, rel)
+			}
+		}
+		for _, rel := range fileOrder {
+			// Prefer legacy symbols for rendering (have full signature lines).
+			if syms, ok := legacySyms[rel]; ok {
+				sb.WriteString(formatRepoMapBlock(rel, syms))
+				continue
+			}
+			// Fallback: render from rich symbols.
+			if richSyms, ok := fileSyms[rel]; ok {
+				var legacyFallback []Symbol
+				for _, s := range richSyms {
+					if s.IsDef {
+						legacyFallback = append(legacyFallback, Symbol{
+							Line:      s.Line,
+							Kind:      s.Kind,
+							Signature: s.Name,
+						})
+					}
+				}
+				if len(legacyFallback) > 0 {
+					sb.WriteString(formatRepoMapBlock(rel, legacyFallback))
+				}
+			}
+		}
+		return sb.String()
+	}
+
+	// Binary search for the largest n where tokens <= budget+tolerance.
+	lo, hi := 0, len(tags)
+	result := header
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		candidate := renderGroup(mid)
+		cost := EstimateTokens(candidate)
+		if cost <= budget+tolerance {
+			result = candidate
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return result
+}
+
+// extractLegacyFallback extracts legacy symbols for files that have no rich symbols yet.
+func extractLegacyFallback(path string, content []byte) []Symbol {
+	syms, err := loadSidecar(path)
+	if err == nil {
+		return syms
+	}
+	return ExtractSymbols(path, content)
+}
+
+// extractMentionedIdents collects base names from focus file paths.
+func extractMentionedIdents(focusFiles []string) map[string]bool {
+	m := make(map[string]bool, len(focusFiles))
+	for _, f := range focusFiles {
+		base := strings.TrimSuffix(filepath.Base(f), filepath.Ext(f))
+		if base != "" {
+			m[base] = true
+		}
+		// Also tokenise the base name (e.g. "userHandler" → "user", "handler").
+		for _, tok := range splitCamel(base) {
+			m[tok] = true
+		}
+	}
+	return m
+}
+
+// splitCamel splits a camelCase or snake_case identifier into lowercase tokens.
+func splitCamel(s string) []string {
+	var tokens []string
+	var cur strings.Builder
+	for _, r := range s {
+		if r == '_' || r == '-' {
+			if cur.Len() > 0 {
+				tokens = append(tokens, strings.ToLower(cur.String()))
+				cur.Reset()
+			}
+			continue
+		}
+		if unicode.IsUpper(r) && cur.Len() > 0 {
+			tokens = append(tokens, strings.ToLower(cur.String()))
+			cur.Reset()
+		}
+		cur.WriteRune(r)
+	}
+	if cur.Len() > 0 {
+		tokens = append(tokens, strings.ToLower(cur.String()))
+	}
+	return tokens
+}
+
+// formatRepoMapBlock formats a file's symbols in ctags-style for the repo map output.
+func formatRepoMapBlock(relPath string, syms []Symbol) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s\n", relPath)
+	for _, s := range syms {
+		fmt.Fprintf(&sb, "  %d\t%s\t%s\n", s.Line, s.Kind, s.Signature)
+	}
+	return sb.String()
 }
 
 func firstIdent(s string) string {
@@ -185,10 +313,6 @@ func firstIdent(s string) string {
 		}
 	}
 	return s[:end]
-}
-
-func isExported(name string) bool {
-	return len(name) > 0 && name[0] >= 'A' && name[0] <= 'Z'
 }
 
 func isSourceFile(name string) bool {

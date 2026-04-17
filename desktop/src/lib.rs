@@ -43,10 +43,30 @@ pub fn run() {
       // project directory instead of defaulting to the Tauri resource dir.
       // Priority: CLI arg > POLVO_ROOT env > current dir
       // e.g. `polvo /path/to/project` or `polvo .`
-      let polvo_root = std::env::args()
-        .nth(1)
+      let args: Vec<String> = std::env::args().collect();
+      let reset = args.iter().any(|a| a == "--reset" || a == "--clean");
+
+      // --reset / --clean: wipe WebKit localStorage so the app starts fresh.
+      if reset {
+        // On macOS: ~/Library/WebKit/<identifier>/WebsiteData
+        #[cfg(target_os = "macos")]
+        if let Ok(home) = app.path().home_dir() {
+          let webkit_data = home
+            .join("Library/WebKit")
+            .join(app.config().identifier.clone())
+            .join("WebsiteData");
+          if webkit_data.exists() {
+            let _ = std::fs::remove_dir_all(&webkit_data);
+            log::info!("--reset: cleared WebKit storage at {:?}", webkit_data);
+          }
+        }
+      }
+
+      let polvo_root = args.iter()
+        .skip(1)
+        .find(|a| !a.starts_with("--"))
         .and_then(|arg| {
-          let path = std::path::Path::new(&arg);
+          let path = std::path::Path::new(arg);
           if path.is_dir() {
             path.canonicalize().ok().map(|p| p.to_string_lossy().to_string())
           } else {

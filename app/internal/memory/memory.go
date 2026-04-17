@@ -78,14 +78,17 @@ type Store struct {
 
 // Entry is a single memory record.
 type Entry struct {
-	ID        int64
-	SessionID string
-	Agent     string
-	File      string // optional
-	Type      string // observation | decision | issue | context | metrics | cost | audit
-	Content   string
-	Timestamp int64 // unix nano
-	ExpiresAt int64 // unix nano; 0 means no expiry
+	ID         int64
+	SessionID  string
+	Agent      string
+	File       string // optional
+	Type       string // observation | decision | issue | context | metrics | cost | audit
+	Content    string
+	Timestamp  int64   // unix nano
+	ExpiresAt  int64   // unix nano; 0 means no expiry
+	UsageCount int     // incremented on each Read that returns this entry
+	LastUsedAt int64   // unix nano of last access
+	Score      float64 // UsageCount / age_days — computed on the fly, not persisted
 }
 
 // Filter narrows a Read query.
@@ -129,6 +132,12 @@ func OpenWithTTL(root string, ttl TTLConfig) (*Store, error) {
 		return nil, fmt.Errorf("migrating memory schema: %w", err)
 	}
 
+	// Migrate: add usage_count and last_used_at columns for scoring.
+	if err := migrateUsageTracking(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrating usage tracking: %w", err)
+	}
+
 	return &Store{db: db, ttl: ttl}, nil
 }
 
@@ -159,6 +168,43 @@ func migrateExpiresAt(db *sql.DB) error {
 
 	_, err = db.Exec(`ALTER TABLE memory ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0`)
 	return err
+}
+
+// migrateUsageTracking adds usage_count and last_used_at columns if absent.
+func migrateUsageTracking(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(memory)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	existing := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if !existing["usage_count"] {
+		if _, err := db.Exec(`ALTER TABLE memory ADD COLUMN usage_count INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if !existing["last_used_at"] {
+		if _, err := db.Exec(`ALTER TABLE memory ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // expiresAtForType returns the unix-nano expiry for the given entry type, or 0 if no TTL.
@@ -205,8 +251,10 @@ func (s *Store) Write(entry Entry) error {
 }
 
 // Read returns entries matching the filter, ordered by timestamp desc.
+// Each returned entry has its usage_count incremented and last_used_at updated.
 func (s *Store) Read(filter Filter) ([]Entry, error) {
-	query := `SELECT id, COALESCE(session_id,''), agent, COALESCE(file,''), type, content, timestamp, expires_at
+	query := `SELECT id, COALESCE(session_id,''), agent, COALESCE(file,''), type, content, timestamp, expires_at,
+	                 usage_count, last_used_at
 	          FROM memory WHERE 1=1`
 	var args []any
 
@@ -243,9 +291,74 @@ func (s *Store) Read(filter Filter) ([]Entry, error) {
 	var entries []Entry
 	for rows.Next() {
 		var e Entry
-		if err := rows.Scan(&e.ID, &e.SessionID, &e.Agent, &e.File, &e.Type, &e.Content, &e.Timestamp, &e.ExpiresAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.SessionID, &e.Agent, &e.File, &e.Type, &e.Content,
+			&e.Timestamp, &e.ExpiresAt, &e.UsageCount, &e.LastUsedAt); err != nil {
 			return nil, err
 		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Bump usage counters for returned entries.
+	if len(entries) > 0 {
+		now := time.Now().UnixNano()
+		ids := make([]any, len(entries))
+		for i, e := range entries {
+			ids[i] = e.ID
+		}
+		// Build a parameterized IN clause.
+		placeholders := "?"
+		for i := 1; i < len(ids); i++ {
+			placeholders += ",?"
+		}
+		args := append([]any{now}, ids...)
+		_, _ = s.db.Exec(
+			`UPDATE memory SET usage_count = usage_count + 1, last_used_at = ? WHERE id IN (`+placeholders+`)`,
+			args...,
+		)
+	}
+	return entries, nil
+}
+
+// TopN returns the n entries with the highest usage score for the given agent and type.
+// Score = usage_count / max(1, age_days). Expired entries are excluded.
+func (s *Store) TopN(agentName, entryType string, n int) ([]Entry, error) {
+	now := time.Now().UnixNano()
+	query := `SELECT id, COALESCE(session_id,''), agent, COALESCE(file,''), type, content, timestamp, expires_at,
+	                 usage_count, last_used_at
+	          FROM memory
+	          WHERE (expires_at = 0 OR expires_at > ?) AND agent = ?`
+	args := []any{now, agentName}
+
+	if entryType != "" {
+		query += " AND type = ?"
+		args = append(args, entryType)
+	}
+
+	query += " ORDER BY CAST(usage_count AS REAL) / MAX(1.0, (? - timestamp) / 86400000000000.0) DESC LIMIT ?"
+	args = append(args, now, n)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []Entry
+	ageDivisor := float64(24 * int64(time.Hour))
+	for rows.Next() {
+		var e Entry
+		if err := rows.Scan(&e.ID, &e.SessionID, &e.Agent, &e.File, &e.Type, &e.Content,
+			&e.Timestamp, &e.ExpiresAt, &e.UsageCount, &e.LastUsedAt); err != nil {
+			return nil, err
+		}
+		ageDays := float64(now-e.Timestamp) / ageDivisor
+		if ageDays < 1 {
+			ageDays = 1
+		}
+		e.Score = float64(e.UsageCount) / ageDays
 		entries = append(entries, e)
 	}
 	return entries, rows.Err()

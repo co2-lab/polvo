@@ -14,11 +14,13 @@ type Entry struct {
 	AgentName  string
 	SessionID  string
 	ToolName   string
-	ToolInput  json.RawMessage
-	RiskLevel  string
-	Decision   string // "allow" | "deny" | "ask-approved" | "ask-denied"
-	DurationMs int64
-	Error      string
+	ToolInput     json.RawMessage
+	ToolInputHash string
+	RiskLevel     string
+	Decision      string // "allow" | "deny" | "ask-approved" | "ask-denied"
+	DurationMs    int64
+	Error         string
+	ReplayID      string
 }
 
 // Logger appends audit entries.

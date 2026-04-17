@@ -203,6 +203,13 @@ func (idx *ChunkIndex) GetByPath(path string) ([]Chunk, error) {
 	return scanChunks(rows)
 }
 
+// Count returns the total number of chunks in the index.
+func (idx *ChunkIndex) Count() (int, error) {
+	var n int
+	err := idx.db.QueryRow("SELECT COUNT(*) FROM code_chunks").Scan(&n)
+	return n, err
+}
+
 // Close closes the underlying database connection.
 func (idx *ChunkIndex) Close() error {
 	return idx.db.Close()

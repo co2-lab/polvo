@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/co2-lab/polvo/internal/config"
@@ -22,18 +24,23 @@ func runHook(name string) error {
 }
 
 func runPreCommitHook() error {
-	cwd, err := os.Getwd()
+	// Resolve the git repo root so we can find polvo.yaml regardless of where
+	// the hook process is invoked from.
+	rootBytes, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
 	if err != nil {
-		return nil // can't determine cwd, skip silently
+		return nil // not in a git repo, skip silently
 	}
+	repoRoot := strings.TrimSpace(string(rootBytes))
+	projectConfig := filepath.Join(repoRoot, "polvo.yaml")
 
-	cfg, _ := config.LoadWithUser("polvo.yaml")
+	cfg, _ := config.LoadWithUser(projectConfig)
 
+	// Defaults come from the embedded config.yaml (enabled: true, secrets_scan: true, etc.).
+	// If config loading failed entirely, fall back to safe defaults.
 	hook := config.PreCommitHookConfig{
 		Enabled:        true,
 		CheckPolvoYAML: true,
 		SecretsScan:    true,
-		AIScan:         false,
 	}
 	if cfg != nil {
 		hook = cfg.Hooks.PreCommit
@@ -42,8 +49,6 @@ func runPreCommitHook() error {
 	if !hook.Enabled {
 		return nil
 	}
-
-	_ = cwd
 
 	// --- Check 1: api_key hardcoded in polvo.yaml ---
 	if hook.CheckPolvoYAML {
@@ -60,7 +65,7 @@ func runPreCommitHook() error {
 
 	// --- Check 2: regex + entropy secrets scan ---
 	if hook.SecretsScan {
-		if err := checkSecretsInDiff(diff); err != nil {
+		if err := checkSecretsInDiff(diff, hook.SecretsScanIgnore); err != nil {
 			return err
 		}
 	}
@@ -123,45 +128,148 @@ func stagedDiff() (string, error) {
 	return string(out), nil
 }
 
-// checkSecretsInDiff runs regex + entropy scan on added lines in the diff.
-func checkSecretsInDiff(diff string) error {
-	// Only scan added lines (lines starting with '+' but not '+++').
-	var added strings.Builder
+// fileFinding records a secret detection hit with file context.
+type fileFinding struct {
+	file    string
+	lineNum int
+	pattern string
+	preview string // first 60 chars of the offending line
+}
+
+// isSecretScanSkipped reports whether path matches any of the user-configured
+// ignore glob patterns. Supports ** (matches any number of path segments),
+// * (matches within a single segment), and ? (matches a single character).
+func isSecretScanSkipped(path string, ignoreGlobs []string) bool {
+	for _, pattern := range ignoreGlobs {
+		if globMatch(pattern, path) {
+			return true
+		}
+	}
+	return false
+}
+
+// globMatch matches path against pattern with support for **.
+// ** matches zero or more path segments; * matches within a single segment.
+func globMatch(pattern, path string) bool {
+	// Normalise separators.
+	pattern = filepath.ToSlash(pattern)
+	path = filepath.ToSlash(path)
+
+	patParts := strings.Split(pattern, "/")
+	pathParts := strings.Split(path, "/")
+	return globMatchParts(patParts, pathParts)
+}
+
+func globMatchParts(patParts, pathParts []string) bool {
+	for len(patParts) > 0 {
+		if patParts[0] == "**" {
+			patParts = patParts[1:]
+			if len(patParts) == 0 {
+				return true // ** at end matches everything remaining
+			}
+			// Try matching the rest of the pattern against every suffix of pathParts.
+			for i := range pathParts {
+				if globMatchParts(patParts, pathParts[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(pathParts) == 0 {
+			return false
+		}
+		ok, _ := filepath.Match(patParts[0], pathParts[0])
+		if !ok {
+			return false
+		}
+		patParts = patParts[1:]
+		pathParts = pathParts[1:]
+	}
+	return len(pathParts) == 0
+}
+
+// checkSecretsInDiff runs regex + entropy scan on added lines in the diff,
+// tracking which file and line number each finding comes from.
+// ignoreGlobs is the list of path patterns configured via secrets_scan_ignore.
+func checkSecretsInDiff(diff string, ignoreGlobs []string) error {
+	var findings []fileFinding
+	currentFile := ""
+	diffLineNum := 0 // line number within the file (from @@ hunk header)
+
 	for _, line := range strings.Split(diff, "\n") {
+		// Track current file from diff headers.
+		if strings.HasPrefix(line, "+++ b/") {
+			currentFile = strings.TrimPrefix(line, "+++ b/")
+			diffLineNum = 0
+			continue
+		}
+		// Parse hunk headers to track line numbers: @@ -a,b +c,d @@
+		if strings.HasPrefix(line, "@@") {
+			// Extract the '+' side start line: @@ -old +new,count @@
+			var newStart int
+			if _, err := fmt.Sscanf(line, "@@ -%*d,%*d +%d", &newStart); err != nil {
+				fmt.Sscanf(line, "@@ -%*d +%d", &newStart) //nolint:errcheck
+			}
+			diffLineNum = newStart - 1 // will be incremented on first '+' or ' ' line
+			continue
+		}
+		if strings.HasPrefix(line, "-") {
+			continue // deleted lines don't count toward new file line numbers
+		}
+		if strings.HasPrefix(line, " ") {
+			diffLineNum++
+			continue
+		}
 		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
-			added.WriteString(line[1:]) // strip leading '+'
-			added.WriteByte('\n')
+			diffLineNum++
+			if isSecretScanSkipped(currentFile, ignoreGlobs) {
+				continue
+			}
+			content := line[1:] // strip leading '+'
+			result := secrets.MaskSecretsDetailed(content)
+			for _, r := range result.Redactions {
+				preview := content
+				if len(preview) > 60 {
+					preview = preview[:60] + "..."
+				}
+				findings = append(findings, fileFinding{
+					file:    currentFile,
+					lineNum: diffLineNum,
+					pattern: r.Pattern,
+					preview: strings.TrimSpace(preview),
+				})
+			}
 		}
 	}
 
-	content := added.String()
-	if content == "" {
+	if len(findings) == 0 {
 		return nil
 	}
 
-	result := secrets.MaskSecretsDetailed(content)
-	if len(result.Redactions) == 0 {
-		return nil
-	}
-
-	// Build a summary of what was found.
-	seen := make(map[string]bool)
-	var findings []string
-	for _, r := range result.Redactions {
-		if !seen[r.Pattern] {
-			seen[r.Pattern] = true
-			findings = append(findings, r.Pattern)
+	// Deduplicate: one entry per (file, pattern), keeping lowest line number.
+	type key struct{ file, pattern string }
+	seen := make(map[key]fileFinding)
+	for _, f := range findings {
+		k := key{f.file, f.pattern}
+		if _, ok := seen[k]; !ok {
+			seen[k] = f
 		}
 	}
+
+	var lines []string
+	for _, f := range seen {
+		lines = append(lines, fmt.Sprintf("  %s:%d  [%s]  %s", f.file, f.lineNum, f.pattern, f.preview))
+	}
+	sort.Strings(lines)
 
 	return fmt.Errorf(`
 polvo: commit blocked — possible secrets detected in staged changes
 
-  Detected patterns: %s
+%s
 
   Review your changes and remove any credentials before committing.
   If this is a false positive, use: git commit --no-verify`,
-		strings.Join(findings, ", "))
+		strings.Join(lines, "\n"))
 }
 
 // checkSecretsWithAI sends the staged diff to an LLM for secret detection.

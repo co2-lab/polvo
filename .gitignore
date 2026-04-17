@@ -46,3 +46,4 @@ ui/dist/
 *.swp
 *.swo
 *~
+*.symbols
