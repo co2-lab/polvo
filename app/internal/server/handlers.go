@@ -126,6 +126,9 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	snap.Status.AgentRunning = s.agentRunning()
+	if s.deps.Cfg != nil {
+		snap.Status.TelemetryDisabled = s.deps.Cfg.Telemetry.Disabled
+	}
 	writeSSEEvent(w, flusher, Event{
 		Kind:    EventSnapshot,
 		Payload: mustJSON(snap),

@@ -29,6 +29,16 @@ type Config struct {
 	Settings    SettingsConfig                  `koanf:"settings"`
 	Permissions PermissionsConfig               `koanf:"permissions"`
 	Hooks       HooksConfig                     `koanf:"hooks"`
+	Telemetry   TelemetryConfig                 `koanf:"telemetry"`
+}
+
+// TelemetryConfig controls error reporting. Enabled by default; users can opt out.
+type TelemetryConfig struct {
+	// Disabled turns off all telemetry. Set in ~/.polvo/config.yaml or polvo.yaml:
+	//   telemetry:
+	//     disabled: true
+	Disabled    bool   `koanf:"disabled"`
+	Environment string `koanf:"environment"` // e.g. "production", "development"
 }
 
 // ProjectConfig holds project metadata.

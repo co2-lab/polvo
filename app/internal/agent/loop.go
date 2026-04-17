@@ -190,6 +190,9 @@ type LoopConfig struct {
 	OnToolCall    func(call provider.ToolCall)
 	OnToolResult  func(id, name, result string, isError bool)
 	OnTurnSummary func(turnIdx int, summary string) // called when inline summary extracted
+	// OnRetry is called before each provider retry so the caller can surface
+	// status to the user. attempt is 1-based. delay is the wait before retry.
+	OnRetry func(err error, attempt int, delay time.Duration)
 }
 
 // LoopResult is the outcome of a loop execution.
@@ -209,6 +212,7 @@ type Loop struct {
 	conv                *Conversation
 	stuck               *StuckDetector
 	consecutiveTimeouts int
+	providerRetries     int
 }
 
 // Conv returns the conversation managed by this loop. Used by callers that need
@@ -418,25 +422,54 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 
 		// Use streaming when available and delta callback or EventStream is configured.
 		if sp, ok := l.cfg.Provider.(provider.StreamProvider); ok && (l.cfg.OnTextDelta != nil || l.cfg.EventStream != nil) {
-			resp, err = sp.ChatStream(ctx, chatReq, func(event provider.StreamEvent) {
-				if event.Type == "text_delta" {
-					if l.cfg.OnTextDelta != nil {
-						l.cfg.OnTextDelta(event.TextDelta)
+			resp, err = traceChat(ctx, l.cfg.Model, func(ctx context.Context) (*provider.ChatResponse, error) {
+				return sp.ChatStream(ctx, chatReq, func(event provider.StreamEvent) {
+					if event.Type == "text_delta" {
+						if l.cfg.OnTextDelta != nil {
+							l.cfg.OnTextDelta(event.TextDelta)
+						}
+						if l.cfg.EventStream != nil {
+							l.cfg.EventStream.Emit(StreamEvent{
+								Kind:      EventTurnStart,
+								AgentName: l.cfg.Model,
+								SessionID: l.cfg.SessionID,
+								Message:   event.TextDelta,
+							})
+						}
 					}
-					if l.cfg.EventStream != nil {
-						l.cfg.EventStream.Emit(StreamEvent{
-							Kind:      EventTurnStart,
-							AgentName: l.cfg.Model,
-							SessionID: l.cfg.SessionID,
-							Message:   event.TextDelta,
-						})
-					}
-				}
+				})
 			})
 		} else {
-			resp, err = l.cfg.Provider.Chat(ctx, chatReq)
+			resp, err = traceChat(ctx, l.cfg.Model, func(ctx context.Context) (*provider.ChatResponse, error) {
+				return l.cfg.Provider.Chat(ctx, chatReq)
+			})
 		}
 		if err != nil {
+			// Retry retriable provider errors (rate limit, overload, server errors)
+			// using exponential backoff with the server's Retry-After hint.
+			if retriable, retryAfter := provider.IsRetriableErr(err); retriable {
+				const maxProviderRetries = 5
+				if l.providerRetries < maxProviderRetries {
+					delay := provider.ExponentialBackoffWithHint(
+						l.providerRetries, 2*time.Second, 60*time.Second, retryAfter,
+					)
+					l.providerRetries++
+					slog.Info("provider error — retrying",
+						"err", err, "attempt", l.providerRetries,
+						"delay", delay, "retryAfter", retryAfter)
+					if l.cfg.OnRetry != nil {
+						l.cfg.OnRetry(err, l.providerRetries, delay)
+					}
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(delay):
+					}
+					continue
+				}
+			}
+			l.providerRetries = 0
+
 			if errors.Is(err, context.DeadlineExceeded) && l.cfg.MaxConsecutiveTimeouts > 0 {
 				l.consecutiveTimeouts++
 				if l.consecutiveTimeouts >= l.cfg.MaxConsecutiveTimeouts {
@@ -481,6 +514,7 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 			return nil, fmt.Errorf("chat turn %d: %w", turnCount, err)
 		}
 		l.consecutiveTimeouts = 0
+		l.providerRetries = 0
 
 		// Fire after_model_call hook.
 		l.cfg.Hooks.RunAfterModelCall(l.cfg.System, l.cfg.Model, turnCount, resp.TokensUsed.TotalTokens)

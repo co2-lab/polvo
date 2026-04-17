@@ -52,16 +52,17 @@ type ProviderStatus struct {
 
 // StatusResponse is the payload for GET /api/status.
 type StatusResponse struct {
-	Project      string `json:"project"`
-	ProjectColor string `json:"project_color,omitempty"`
-	ProjectIcon  string `json:"project_icon,omitempty"`
-	Version      string `json:"version"`
-	CommitSHA    string `json:"commit_sha,omitempty"`
-	BuildDate    string `json:"build_date,omitempty"`
-	Cwd          string `json:"cwd"`
-	Watching     bool   `json:"watching"`
-	AgentRunning bool   `json:"agent_running"`
-	DashboardURL string `json:"dashboard_url"`
+	Project             string `json:"project"`
+	ProjectColor        string `json:"project_color,omitempty"`
+	ProjectIcon         string `json:"project_icon,omitempty"`
+	Version             string `json:"version"`
+	CommitSHA           string `json:"commit_sha,omitempty"`
+	BuildDate           string `json:"build_date,omitempty"`
+	Cwd                 string `json:"cwd"`
+	Watching            bool   `json:"watching"`
+	AgentRunning        bool   `json:"agent_running"`
+	DashboardURL        string `json:"dashboard_url"`
+	TelemetryDisabled   bool   `json:"telemetry_disabled,omitempty"`
 }
 
 // SnapshotPayload is sent to new SSE subscribers to give them current state.

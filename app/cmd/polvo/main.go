@@ -19,6 +19,7 @@ import (
 
 	"github.com/co2-lab/polvo/internal/agent"
 	"github.com/co2-lab/polvo/internal/config"
+	"github.com/co2-lab/polvo/internal/telemetry"
 	"github.com/co2-lab/polvo/internal/git"
 	"github.com/co2-lab/polvo/internal/guide"
 	"github.com/co2-lab/polvo/internal/ignore"
@@ -159,6 +160,16 @@ func runTUI() error {
 	cfg, _ := config.LoadWithUser("polvo.yaml")
 	if cfg == nil {
 		cfg, _ = config.LoadWithUser("")
+	}
+
+	// Opt-in error reporting — only active when sentry_dsn is set in user config.
+	if cfg != nil {
+		telemetry.Init(telemetry.Config{
+			Disabled:    cfg.Telemetry.Disabled,
+			Environment: cfg.Telemetry.Environment,
+			Release:     Version,
+		})
+		defer telemetry.Flush()
 	}
 
 	memStore, _ := memory.Open(cwd)
@@ -436,6 +447,16 @@ func runServer() {
 	cfg, err := config.LoadWithUser("polvo.yaml")
 	if err != nil {
 		slog.Warn("failed to load config, running in unconfigured mode", "error", err)
+	}
+
+	// Opt-in error reporting — only active when sentry_dsn is set in user config.
+	if cfg != nil {
+		telemetry.Init(telemetry.Config{
+			Disabled:    cfg.Telemetry.Disabled,
+			Environment: cfg.Telemetry.Environment,
+			Release:     Version,
+		})
+		defer telemetry.Flush()
 	}
 
 	var registry *provider.Registry

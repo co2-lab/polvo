@@ -126,6 +126,14 @@ type toolCallMsg struct {
 type approvalRequestMsg struct{ req agent.ApprovalRequest }
 type approvalSessionMsg struct{ toolName string } // allow this tool for the rest of the session
 type agentSuspendedMsg struct{ signal agent.SuspendSignal }
+type providerRetryMsg struct {
+	attempt     int
+	maxAttempts int
+	delay       time.Duration
+	deadline    time.Time
+	errText     string // original error message
+}
+type retryTickMsg struct{}
 type turnSummaryDoneMsg struct {
 	turnIdx int
 	summary string
@@ -281,9 +289,14 @@ type model struct {
 	approvalResCh    chan agent.ApprovalDecision
 	perm             *tuiPermission
 
-	currentDelta string
-	status       string
-	startedAt    time.Time
+	currentDelta  string
+	status        string
+	retryDeadline        time.Time // non-zero while waiting for a provider retry
+	retryAttempt         int
+	retryMaxAttempts     int
+	retryErrText         string // original error message from the first retry trigger
+	retryCancelledByUser bool
+	startedAt     time.Time
 	// live token accumulation (updated per turn via agentDoneMsg)
 	liveTokens int
 	liveCost   float64
@@ -637,6 +650,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "ready"
 				return m, nil
 			}
+			if !m.retryDeadline.IsZero() && m.cancelRun != nil {
+				m.cancelRun()
+				errMsg := retryErrorMsg(m.retryErrText, m.retryAttempt, m.retryMaxAttempts, true)
+				m.retryDeadline = time.Time{}
+				m.retryCancelledByUser = true
+				m.status = "cancelled"
+				m.appendHistory("error", errMsg, provider.TokenUsage{}, 0)
+				m.refreshViewport()
+				m.viewport.GotoBottom()
+				return m, nil
+			}
 
 		case tea.KeyTab:
 			if !m.awaitingApproval && !m.agentRunning {
@@ -733,6 +757,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshViewport()
 
+	case providerRetryMsg:
+		m.retryDeadline = msg.deadline
+		m.retryAttempt = msg.attempt
+		m.retryMaxAttempts = msg.maxAttempts
+		if m.retryErrText == "" {
+			m.retryErrText = msg.errText
+		}
+		secs := int(time.Until(m.retryDeadline).Seconds()) + 1
+		m.status = fmt.Sprintf("rate limit — retrying in %ds (attempt %d/%d)…", secs, m.retryAttempt, m.retryMaxAttempts)
+		m.refreshViewport()
+		cmds = append(cmds, tea.Tick(time.Second, func(time.Time) tea.Msg { return retryTickMsg{} }))
+
+	case retryTickMsg:
+		if m.retryDeadline.IsZero() {
+			break
+		}
+		remaining := time.Until(m.retryDeadline)
+		if remaining <= 0 {
+			m.retryDeadline = time.Time{}
+			m.status = "retrying…"
+		} else {
+			secs := int(remaining.Seconds()) + 1
+			m.status = fmt.Sprintf("rate limit — retrying in %ds (attempt %d/%d)…", secs, m.retryAttempt, m.retryMaxAttempts)
+			cmds = append(cmds, tea.Tick(time.Second, func(time.Time) tea.Msg { return retryTickMsg{} }))
+		}
+		m.refreshViewport()
+
 	case approvalRequestMsg:
 		m.awaitingApproval = true
 		m.pendingReq = msg.req
@@ -786,7 +837,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentDoneMsg:
 		m.agentRunning = false
+		m.retryDeadline = time.Time{}
 		m.cancelRun = nil
+		cancelledByUser := m.retryCancelledByUser
+		hadRetries := m.retryAttempt > 0 && m.retryErrText != ""
+		retryErrText := m.retryErrText
+		retryAttempt := m.retryAttempt
+		retryMaxAttempts := m.retryMaxAttempts
+		m.retryCancelledByUser = false
+		m.retryAttempt = 0
+		m.retryErrText = ""
 		m.liveTokens += msg.tokensUsed.TotalTokens
 		m.liveCost += msg.costUSD
 		if len(m.toolCalls) > 0 {
@@ -797,8 +857,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendHistory("assistant", m.currentDelta, msg.tokensUsed, msg.costUSD)
 			m.currentDelta = ""
 		}
-		if msg.err != nil {
-			m.appendHistory("error", friendlyError(msg.err.Error()), provider.TokenUsage{}, 0)
+		if msg.err != nil && !cancelledByUser {
+			var errMsg string
+			if hadRetries {
+				errMsg = retryErrorMsg(retryErrText, retryAttempt, retryMaxAttempts, false)
+			} else {
+				errMsg = friendlyError(msg.err.Error())
+			}
+			m.appendHistory("error", errMsg, provider.TokenUsage{}, 0)
 		}
 		// Finish active work item (non-blocking).
 		if m.activeWorkItemID != "" && m.cfg.SessionManager != nil {
@@ -1164,6 +1230,15 @@ func (m *model) startAgent(prompt string) tea.Cmd {
 		},
 		OnTurnSummary: func(turnIdx int, summary string) {
 			prog.Send(turnSummaryDoneMsg{turnIdx: turnIdx, summary: summary})
+		},
+		OnRetry: func(err error, attempt int, delay time.Duration) {
+			prog.Send(providerRetryMsg{
+				attempt:     attempt,
+				maxAttempts: 5,
+				delay:       delay,
+				deadline:    time.Now().Add(delay),
+				errText:     friendlyError(err.Error()),
+			})
 		},
 	}
 
@@ -1915,6 +1990,16 @@ func fmtCost(usd float64) string {
 }
 
 func drainChan(_ agentDeltaMsg) tea.Cmd { return nil }
+
+// retryErrorMsg builds the full error message shown in history after retries.
+// cancelled=true when the user pressed Esc; false when retries were exhausted.
+func retryErrorMsg(errText string, attempts, maxAttempts int, cancelled bool) string {
+	suffix := fmt.Sprintf("(%d/%d retries)", attempts, maxAttempts)
+	if cancelled {
+		return fmt.Sprintf("%s — cancelled by user %s", errText, suffix)
+	}
+	return fmt.Sprintf("%s — gave up after %s", errText, suffix)
+}
 
 // friendlyError converts raw API error JSON/messages into readable one-liners.
 func friendlyError(msg string) string {
