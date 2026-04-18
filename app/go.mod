@@ -20,7 +20,7 @@ require (
 	github.com/knadh/koanf/parsers/yaml v1.1.0
 	github.com/knadh/koanf/providers/rawbytes v1.0.0
 	github.com/knadh/koanf/v2 v2.3.3
-	github.com/ollama/ollama v0.17.6
+	github.com/ollama/ollama v0.21.0
 	github.com/sabhiram/go-gitignore v0.0.0-20210923224102-525f6e181f06
 	golang.org/x/term v0.42.0
 	gopkg.in/yaml.v3 v3.0.1
