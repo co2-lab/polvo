@@ -1,3 +1,4 @@
+import React from 'react'
 import { useIDEStore } from '../../store/useIDEStore'
 import { useT } from '../../lib/i18n'
 import {
@@ -23,10 +24,119 @@ import { motion, type PanInfo } from 'framer-motion'
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 
+function useWorkspaceTabDrop(wsId: string) {
+  const { setActiveWorkspace, movePanelToWorkspace, draggedPanelId } = useIDEStore()
+  const [flashCount, setFlashCount] = useState(0)
+  const [isDragOver, setIsDragOver] = useState(false)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Clean up timers on unmount
+  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current) }, [])
+
+  const onDragOver = useCallback((e: React.DragEvent) => {
+    if (!draggedPanelId) return
+    e.preventDefault()
+    setIsDragOver(true)
+  }, [draggedPanelId])
+
+  const onDragLeave = useCallback(() => setIsDragOver(false), [])
+
+  const onDrop = useCallback((e: React.DragEvent) => {
+    const panelId = e.dataTransfer.getData('application/x-panel')
+    if (!panelId) return
+    e.preventDefault()
+    setIsDragOver(false)
+
+    // Flash 3 times then switch workspace
+    let count = 0
+    const flash = () => {
+      setFlashCount(c => c + 1)
+      count++
+      if (count < 3) {
+        timerRef.current = setTimeout(flash, 200)
+      } else {
+        timerRef.current = setTimeout(() => {
+          setFlashCount(0)
+          setActiveWorkspace(wsId)
+          movePanelToWorkspace(panelId, wsId)
+        }, 200)
+      }
+    }
+    flash()
+  }, [wsId, setActiveWorkspace, movePanelToWorkspace])
+
+  return { isDragOver, flashCount, onDragOver, onDragLeave, onDrop }
+}
+
 interface ContextMenu {
   wsId: string
   x: number
   y: number
+}
+
+interface WorkspaceTabProps {
+  ws: { id: string; name: string }
+  isActive: boolean
+  isPinned: boolean
+  renamingId: string | null
+  renameValue: string
+  renameInputRef: React.RefObject<HTMLInputElement | null>
+  setRenameValue: (v: string) => void
+  commitRename: () => void
+  setRenamingId: (id: string | null) => void
+  setActiveWorkspace: (id: string) => void
+  handleContextMenu: (e: React.MouseEvent, wsId: string) => void
+  startRename: (wsId: string, name: string) => void
+}
+
+function WorkspaceTab({
+  ws, isActive, isPinned, renamingId, renameValue, renameInputRef,
+  setRenameValue, commitRename, setRenamingId, setActiveWorkspace,
+  handleContextMenu, startRename,
+}: WorkspaceTabProps) {
+  const { isDragOver, flashCount, onDragOver, onDragLeave, onDrop } = useWorkspaceTabDrop(ws.id)
+  const isFlashing = flashCount > 0 && flashCount % 2 === 1
+
+  return (
+    <div className="relative shrink-0">
+      {renamingId === ws.id ? (
+        <input
+          ref={renameInputRef}
+          value={renameValue}
+          onChange={e => setRenameValue(e.target.value)}
+          onBlur={commitRename}
+          onKeyDown={e => {
+            if (e.key === 'Enter') commitRename()
+            if (e.key === 'Escape') setRenamingId(null)
+          }}
+          className="px-3 py-1.5 text-sm font-medium bg-white/10 border border-white/20 text-white outline-none w-32"
+        />
+      ) : (
+        <button
+          onClick={() => setActiveWorkspace(ws.id)}
+          onContextMenu={e => handleContextMenu(e, ws.id)}
+          onDoubleClick={() => startRename(ws.id, ws.name)}
+          onDragOver={onDragOver}
+          onDragLeave={onDragLeave}
+          onDrop={onDrop}
+          className={clsx(
+            'group flex items-center gap-2 px-3 h-8 text-sm font-medium transition-all select-none cursor-pointer border-b-2',
+            isActive
+              ? 'text-white border-[color:var(--primary)] bg-white/5'
+              : isDragOver || isFlashing
+                ? 'text-white/80 border-[color:var(--primary)] bg-white/10'
+                : 'text-white/45 border-transparent hover:text-white/80',
+          )}
+        >
+          {isPinned
+            ? <Pin className="w-3 h-3 opacity-50" />
+            : <LayoutTemplate className="w-4 h-4 opacity-70" />
+          }
+          {ws.name}
+        </button>
+      )}
+    </div>
+  )
 }
 
 export function WorkspaceTabs() {
@@ -148,44 +258,7 @@ export function WorkspaceTabs() {
 
   const renderTab = (ws: typeof workspaces[0]) => {
     const isActive = activeWorkspaceId === ws.id
-    return (
-      <div key={ws.id} className="relative shrink-0">
-        {renamingId === ws.id ? (
-          <input
-            ref={renameInputRef}
-            value={renameValue}
-            onChange={e => setRenameValue(e.target.value)}
-            onBlur={commitRename}
-            onKeyDown={e => {
-              if (e.key === 'Enter') commitRename()
-              if (e.key === 'Escape') setRenamingId(null)
-            }}
-            className="px-3 py-1.5 text-sm font-medium bg-white/10 border border-white/20 text-white outline-none w-32"
-          />
-        ) : (
-          <button
-            onClick={() => setActiveWorkspace(ws.id)}
-            onContextMenu={e => handleContextMenu(e, ws.id)}
-            onDoubleClick={() => startRename(ws.id, ws.name)}
-            className={clsx(
-              'group flex items-center gap-2 px-3 h-8 text-sm font-medium transition-all select-none cursor-pointer border-b-2',
-              isActive
-                ? 'text-white border-[color:var(--primary)] bg-white/5'
-                : 'text-white/45 border-transparent hover:text-white/80'
-            )}
-            style={!isActive ? {
-              ['--tw-hover-bg' as string]: 'color-mix(in srgb, var(--primary) 8%, transparent)',
-            } : undefined}
-          >
-            {pinnedWorkspaceIds.includes(ws.id)
-              ? <Pin className="w-3 h-3 opacity-50" />
-              : <LayoutTemplate className="w-4 h-4 opacity-70" />
-            }
-            {ws.name}
-          </button>
-        )}
-      </div>
-    )
+    return <WorkspaceTab key={ws.id} ws={ws} isActive={isActive} isPinned={pinnedWorkspaceIds.includes(ws.id)} renamingId={renamingId} renameValue={renameValue} renameInputRef={renameInputRef} setRenameValue={setRenameValue} commitRename={commitRename} setRenamingId={setRenamingId} setActiveWorkspace={setActiveWorkspace} handleContextMenu={handleContextMenu} startRename={startRename} />
   }
 
   return (

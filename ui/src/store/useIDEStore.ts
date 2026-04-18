@@ -53,6 +53,7 @@ interface IDEState {
   activeProjectId: string | null
   dockItems: DockItem[]
   draggedDockItem: string | null
+  draggedPanelId: string | null
   dockPosition: DockPosition
   isSettingsOpen: boolean
   projectConfigId: string | null
@@ -72,6 +73,8 @@ interface IDEState {
   flashPanelId: string | null
   diffSessions: DiffSession[]
   activeDiffSessionId: string | null
+  /** Per-kind next title index to assign. Resets to 0 when all panels of the kind are closed. */
+  kindTitleCounters: Record<string, number>
 
   setSettingsOpen: (isOpen: boolean) => void
   openProjectConfig: (projectId: string) => void
@@ -79,6 +82,13 @@ interface IDEState {
   setActiveTheme: (id: string) => void
   setDockPosition: (position: DockPosition) => void
   setDraggedDockItem: (id: string | null) => void
+  setDraggedPanelId: (id: string | null) => void
+  movePanel: (
+    sourcePanelId: string,
+    targetPanelId: string,
+    position: 'top' | 'bottom' | 'left' | 'right' | 'center',
+  ) => void
+  movePanelToWorkspace: (sourcePanelId: string, targetWorkspaceId: string) => void
   setSidePanelOpen: (isOpen: boolean) => void
   setSidePanelPosition: (position: 'left' | 'right') => void
   setDockPinned: (isPinned: boolean) => void
@@ -131,7 +141,8 @@ interface IDEState {
 export function getKind(contentId: string): PanelKind {
   if (contentId.startsWith('file:') || contentId.startsWith('newfile:') || contentId === 'editor')
     return 'editor'
-  if (contentId === 'terminal' || contentId.startsWith('cli-')) return 'terminal'
+  if (contentId === 'terminal') return 'terminal'
+  if (contentId.startsWith('cli-')) return 'ai'
   if (contentId === 'explorer') return 'explorer'
   if (contentId === 'agents') return 'agents'
   if (contentId === 'log') return 'log'
@@ -148,6 +159,7 @@ const defaultKindBehaviors: Record<PanelKind, KindBehavior> = {
   log: 'new-panel',
   chat: 'new-panel',
   diff: 'grouped',
+  ai: 'new-panel',
   other: 'new-panel',
 }
 
@@ -315,6 +327,23 @@ function findPlacement(root: LayoutNode): PlacementResult {
   return { kind: 'split-leaf', panelId: best.panelId, direction, parentSplitId: best.parentSplitId }
 }
 
+// Wraps an existing panel node in a new split, placing newChild beside it.
+// The existing panel KEEPS its original id so React doesn't remount it.
+// The new SplitNode gets a fresh id (it's a new structural node).
+function makeSplit(
+  existing: PanelNode,
+  newChild: LayoutNode,
+  direction: SplitDirection,
+  newChildFirst: boolean,
+): SplitNode {
+  return {
+    id: crypto.randomUUID(),
+    type: 'split',
+    direction,
+    children: newChildFirst ? [newChild, existing] : [existing, newChild],
+  }
+}
+
 const collectSplitIds = (node: LayoutNode, ids: Set<string> = new Set()): Set<string> => {
   if (node.type === 'split') {
     ids.add(node.id)
@@ -367,14 +396,108 @@ const removeNodeFromTree = (node: LayoutNode, targetId: string): LayoutNode | nu
       .filter((child): child is LayoutNode => child !== null)
     if (newChildren.length === 0) return null
     if (newChildren.length === 1) {
-      const survivor = newChildren[0]
-      // Restore the split's id on the survivor so the parent Group keeps its saved sizes.
-      // Preserve sessionId so terminal sessions survive the id change.
-      if (survivor.type === 'panel')
-        return { ...survivor, id: node.id, sessionId: survivor.sessionId ?? survivor.id }
-      return { ...survivor, id: node.id }
+      // Return the survivor as-is, preserving its original id.
+      // This prevents React from remounting components (e.g. terminals) when a
+      // sibling panel is removed and the split collapses.
+      return newChildren[0]
     }
     return { ...node, children: newChildren }
+  }
+  return node
+}
+
+/** Collect every PanelNode across all workspaces matching a predicate. */
+function collectAllPanels(workspaces: { layout: LayoutNode | null }[], pred?: (p: PanelNode) => boolean): PanelNode[] {
+  const result: PanelNode[] = []
+  function visit(n: LayoutNode) {
+    if (n.type === 'panel') { if (!pred || pred(n)) result.push(n) }
+    else n.children.forEach(visit)
+  }
+  for (const ws of workspaces) { if (ws.layout) visit(ws.layout) }
+  return result
+}
+
+/** Returns the base title for a panel's contentId given the dock items. */
+function getPanelBaseTitle(contentId: string, dockItems: DockItem[]): string {
+  if (contentId.startsWith('file:')) return contentId.slice(5).split('/').pop() ?? contentId.slice(5)
+  if (contentId.startsWith('newfile:')) return `Untitled-${contentId.slice(8)}`
+  return dockItems.find(i => i.id === contentId)?.name ?? contentId
+}
+
+/**
+ * When a new panel with `baseTitle` is added and another panel with the same title already exists,
+ * activate indexed title mode for that baseTitle: assign titleIndex to all panels with that title
+ * that don't have one yet, and return the next index to assign to the new panel.
+ */
+function activateIndexedMode(
+  workspaces: { id: string; layout: LayoutNode | null; name: string }[],
+  baseTitle: string,
+  dockItems: DockItem[],
+  currentCounter: number,
+): { workspaces: typeof workspaces; nextCounter: number } {
+  let counter = currentCounter
+  const updatedWorkspaces = workspaces.map(ws => {
+    if (!ws.layout) return ws
+    const newLayout = assignMissingIndices(ws.layout, baseTitle, dockItems, () => ++counter)
+    return newLayout !== ws.layout ? { ...ws, layout: newLayout } : ws
+  })
+  return { workspaces: updatedWorkspaces, nextCounter: counter }
+}
+
+/** Walk tree and assign titleIndex to PanelNodes matching baseTitle that don't have one yet. */
+function assignMissingIndices(
+  node: LayoutNode,
+  baseTitle: string,
+  dockItems: DockItem[],
+  next: () => number,
+): LayoutNode {
+  if (node.type === 'split') {
+    const newChildren = node.children.map(c => assignMissingIndices(c, baseTitle, dockItems, next))
+    const changed = newChildren.some((c, i) => c !== node.children[i])
+    return changed ? { ...node, children: newChildren } : node
+  }
+  if (getPanelBaseTitle(node.contentId, dockItems) === baseTitle && node.titleIndex === undefined) {
+    return { ...node, titleIndex: next() }
+  }
+  return node
+}
+
+/**
+ * After a panel with `baseTitle` is removed, reconcile indexed title mode:
+ * - 0 remaining → reset counter, strip titleIndex from all panels with that title
+ * - 1 remaining → strip its titleIndex (back to plain title), reset counter
+ * - 2+ remaining → no change
+ */
+function reconcileTitleIndicesAfterRemoval(
+  workspaces: { id: string; layout: LayoutNode | null; name: string }[],
+  baseTitle: string,
+  dockItems: DockItem[],
+  kindTitleCounters: Record<string, number>,
+): { workspaces: typeof workspaces; kindTitleCounters: Record<string, number> } {
+  const remaining = collectAllPanels(workspaces, p => getPanelBaseTitle(p.contentId, dockItems) === baseTitle)
+  if (remaining.length >= 2) return { workspaces, kindTitleCounters }
+
+  const updatedWorkspaces = workspaces.map(ws => {
+    if (!ws.layout) return ws
+    const newLayout = stripTitleIndices(ws.layout, baseTitle, dockItems)
+    return newLayout !== ws.layout ? { ...ws, layout: newLayout } : ws
+  })
+  return {
+    workspaces: updatedWorkspaces,
+    kindTitleCounters: { ...kindTitleCounters, [baseTitle]: 0 },
+  }
+}
+
+/** Walk tree and remove titleIndex from PanelNodes matching baseTitle. */
+function stripTitleIndices(node: LayoutNode, baseTitle: string, dockItems: DockItem[]): LayoutNode {
+  if (node.type === 'split') {
+    const newChildren = node.children.map(c => stripTitleIndices(c, baseTitle, dockItems))
+    const changed = newChildren.some((c, i) => c !== node.children[i])
+    return changed ? { ...node, children: newChildren } : node
+  }
+  if (getPanelBaseTitle(node.contentId, dockItems) === baseTitle && node.titleIndex !== undefined) {
+    const { titleIndex: _, tabTitleIndices: __, ...rest } = node
+    return rest as PanelNode
   }
   return node
 }
@@ -397,6 +520,7 @@ export const useIDEStore = create<IDEState>()(
       activeProjectId: null,
       dockItems: initialDockItems,
       draggedDockItem: null,
+      draggedPanelId: null,
       dockPosition: { edge: 'bottom', alignment: 'center' },
       isSettingsOpen: false,
       projectConfigId: null,
@@ -434,6 +558,7 @@ export const useIDEStore = create<IDEState>()(
       flashPanelId: null,
       diffSessions: [],
       activeDiffSessionId: null,
+      kindTitleCounters: {},
 
       setSettingsOpen: isOpen => set({ isSettingsOpen: isOpen }),
       openProjectConfig: projectId => set({ projectConfigId: projectId }),
@@ -441,6 +566,203 @@ export const useIDEStore = create<IDEState>()(
       setActiveTheme: id => set({ activeThemeId: id }),
       setDockPosition: position => set({ dockPosition: position }),
       setDraggedDockItem: id => set({ draggedDockItem: id }),
+      setDraggedPanelId: id => set({ draggedPanelId: id }),
+      movePanel: (sourcePanelId, targetPanelId, position) =>
+        set(state => {
+          if (sourcePanelId === targetPanelId) return state
+
+          // Find source panel and target workspace
+          let sourcePanel: PanelNode | null = null
+          let sourceWsIndex = -1
+          let targetWsIndex = -1
+
+          for (let i = 0; i < state.workspaces.length; i++) {
+            const ws = state.workspaces[i]
+            if (!ws.layout) continue
+            if (!sourcePanel) {
+              const found = findPanel(ws.layout, (_, n) => n.id === sourcePanelId)
+              if (found) { sourcePanel = found; sourceWsIndex = i }
+            }
+            if (targetWsIndex === -1) {
+              const found = findPanel(ws.layout, (_, n) => n.id === targetPanelId)
+              if (found) targetWsIndex = i
+            }
+          }
+
+          if (!sourcePanel || sourceWsIndex === -1 || targetWsIndex === -1) {
+            return state
+          }
+
+          const newWorkspaces = [...state.workspaces]
+
+          // center = merge tabs from source into target
+          if (position === 'center') {
+            // For panels where contentId collides (e.g. two "terminal" panels),
+            // use sessionId as the tab identifier so they are distinct tabs.
+            const resolveTabId = (panel: PanelNode): string =>
+              panel.tabs.length === 1 && panel.tabs[0] === panel.contentId && panel.sessionId && panel.sessionId !== panel.contentId
+                ? panel.sessionId
+                : panel.contentId
+
+            const doMerge = (targetNode: PanelNode, src: PanelNode): PanelNode => {
+              const srcTabId = resolveTabId(src)
+              const tgtTabId = resolveTabId(targetNode)
+              const tgtTabs = targetNode.tabs.map(t => t === targetNode.contentId ? tgtTabId : t)
+              if (tgtTabs.includes(srcTabId)) return { ...targetNode, tabs: tgtTabs }
+              // Preserve permanent titleIndex for both tabs
+              const tgtTitleIndex = targetNode.tabTitleIndices?.[tgtTabId] ?? targetNode.titleIndex
+              const srcTitleIndex = src.tabTitleIndices?.[srcTabId] ?? src.titleIndex
+              return {
+                ...targetNode,
+                contentId: tgtTabId,
+                sessionId: targetNode.sessionId,
+                tabs: [...tgtTabs, srcTabId],
+                tabSessions: {
+                  ...targetNode.tabSessions,
+                  [tgtTabId]: targetNode.sessionId ?? targetNode.id,
+                  [srcTabId]: src.sessionId ?? src.id,
+                },
+                tabContentIds: {
+                  ...targetNode.tabContentIds,
+                  [tgtTabId]: targetNode.contentId,
+                  [srcTabId]: src.contentId,
+                },
+                tabTitleIndices: {
+                  ...targetNode.tabTitleIndices,
+                  ...(tgtTitleIndex !== undefined ? { [tgtTabId]: tgtTitleIndex } : {}),
+                  ...(srcTitleIndex !== undefined ? { [srcTabId]: srcTitleIndex } : {}),
+                },
+              }
+            }
+
+            if (sourceWsIndex === targetWsIndex) {
+              const ws = newWorkspaces[sourceWsIndex]
+              if (!ws.layout) return state
+              const targetPanel = findPanel(ws.layout, (_, n) => n.id === targetPanelId)
+              if (!targetPanel) return state
+              const targetSessionId = targetPanel.sessionId ?? targetPanel.id
+              const layoutAfterRemove = removeNodeFromTree(ws.layout, sourcePanelId)
+              if (!layoutAfterRemove) return state
+              const targetAfterRemove = findPanel(
+                layoutAfterRemove,
+                (_, n) => n.id === targetPanelId || (n.sessionId ?? n.id) === targetSessionId,
+              )
+              if (!targetAfterRemove) return state
+              const layoutAfterMerge = replaceNode(layoutAfterRemove, targetAfterRemove.id, n =>
+                n.type === 'panel' ? doMerge(n, sourcePanel!) : n
+              )
+              newWorkspaces[sourceWsIndex] = { ...ws, layout: layoutAfterMerge }
+            } else {
+              const tgtWs = newWorkspaces[targetWsIndex]
+              if (!tgtWs.layout) return state
+              newWorkspaces[targetWsIndex] = { ...tgtWs, layout: mergeInto(tgtWs.layout) }
+              const srcWs = newWorkspaces[sourceWsIndex]
+              newWorkspaces[sourceWsIndex] = {
+                ...srcWs,
+                layout: srcWs.layout ? removeNodeFromTree(srcWs.layout, sourcePanelId) : null,
+              }
+            }
+            return { workspaces: newWorkspaces, draggedPanelId: null }
+          }
+
+          // directional: split target and insert source panel there
+          const direction: SplitDirection =
+            position === 'left' || position === 'right' ? 'horizontal' : 'vertical'
+          const isFirst = position === 'left' || position === 'top'
+
+          const movedPanel: PanelNode = { ...sourcePanel }
+
+          if (sourceWsIndex === targetWsIndex) {
+            const ws = newWorkspaces[sourceWsIndex]
+            if (!ws.layout) return state
+
+            // removeNodeFromTree collapses single-child splits by reassigning the
+            // split's id to the surviving child — so targetPanelId may change.
+            // We find the target panel BEFORE removal to capture its node, then
+            // do the remove, then locate the target by its sessionId or original id.
+            const targetPanel = findPanel(ws.layout, (_, n) => n.id === targetPanelId)
+            if (!targetPanel) return state
+
+            const layoutAfterRemove = removeNodeFromTree(ws.layout, sourcePanelId)
+            if (!layoutAfterRemove) return state
+
+            // After collapse the target panel may have a new id — find it by sessionId
+            const targetSessionId = targetPanel.sessionId ?? targetPanel.id
+            const targetAfterRemove = findPanel(
+              layoutAfterRemove,
+              (_, n) => n.id === targetPanelId || (n.sessionId ?? n.id) === targetSessionId,
+            )
+            if (!targetAfterRemove) return state
+
+            const layoutAfterInsert = replaceNode(layoutAfterRemove, targetAfterRemove.id, targetNode =>
+              makeSplit(targetNode as PanelNode, movedPanel, direction, isFirst)
+            )
+            newWorkspaces[sourceWsIndex] = { ...ws, layout: layoutAfterInsert }
+          } else {
+            // Different workspaces: insert into target first, then remove from source.
+            const tgtWs = newWorkspaces[targetWsIndex]
+            if (!tgtWs.layout) return state
+            const layoutAfterInsert = replaceNode(tgtWs.layout, targetPanelId, targetNode =>
+              makeSplit(targetNode as PanelNode, movedPanel, direction, isFirst)
+            )
+            newWorkspaces[targetWsIndex] = { ...tgtWs, layout: layoutAfterInsert }
+
+            const srcWs = newWorkspaces[sourceWsIndex]
+            newWorkspaces[sourceWsIndex] = {
+              ...srcWs,
+              layout: srcWs.layout ? removeNodeFromTree(srcWs.layout, sourcePanelId) : null,
+            }
+          }
+
+          return { workspaces: newWorkspaces, draggedPanelId: null }
+        }),
+      movePanelToWorkspace: (sourcePanelId, targetWorkspaceId) =>
+        set(state => {
+          let sourcePanel: PanelNode | null = null
+          let sourceWsIndex = -1
+          for (let i = 0; i < state.workspaces.length; i++) {
+            const ws = state.workspaces[i]
+            if (!ws.layout) continue
+            const found = findPanel(ws.layout, (_, n) => n.id === sourcePanelId)
+            if (found) { sourcePanel = found; sourceWsIndex = i; break }
+          }
+          if (!sourcePanel || sourceWsIndex === -1) return state
+          const targetWsIndex = state.workspaces.findIndex(w => w.id === targetWorkspaceId)
+          if (targetWsIndex === -1) return state
+
+          const newWorkspaces = [...state.workspaces]
+          // Remove from source
+          const srcWs = newWorkspaces[sourceWsIndex]
+          newWorkspaces[sourceWsIndex] = {
+            ...srcWs,
+            layout: srcWs.layout ? removeNodeFromTree(srcWs.layout, sourcePanelId) : null,
+          }
+          // Place in target (as root or split with existing)
+          const tgtWs = newWorkspaces[targetWsIndex]
+          if (!tgtWs.layout) {
+            newWorkspaces[targetWsIndex] = { ...tgtWs, layout: sourcePanel }
+          } else {
+            const placement = findPlacement(tgtWs.layout)
+            let newLayout: LayoutNode
+            if (placement.kind === 'split-group') {
+              newLayout = replaceNode(tgtWs.layout, placement.groupId, groupNode => ({
+                id: groupNode.id,
+                type: 'split',
+                direction: placement.direction,
+                children: [
+                  groupNode.type === 'split' ? { ...groupNode, id: crypto.randomUUID() } : groupNode,
+                  sourcePanel!,
+                ],
+              }))
+            } else {
+              newLayout = replaceNode(tgtWs.layout, placement.panelId, targetNode =>
+                makeSplit(targetNode as PanelNode, sourcePanel!, placement.direction, false)
+              )
+            }
+            newWorkspaces[targetWsIndex] = { ...tgtWs, layout: newLayout }
+          }
+          return { workspaces: newWorkspaces, draggedPanelId: null }
+        }),
       setSidePanelOpen: isOpen => set({ isSidePanelOpen: isOpen }),
       setSidePanelPosition: position => set({ sidePanelPosition: position }),
       setDockPinned: isPinned => set({ isDockPinned: isPinned }),
@@ -551,6 +873,26 @@ export const useIDEStore = create<IDEState>()(
           // new-panel behavior (or no existing grouped panel): create a new panel
           const newPanelId = crypto.randomUUID()
           const resolvedProjectId = tabProjectId ?? state.activeProjectId ?? undefined
+
+          // Determine if indexed title mode should activate for this baseTitle.
+          // It activates when there's already at least one panel with the same base title.
+          const baseTitle = getPanelBaseTitle(contentId, state.dockItems)
+          const existingSameTitlePanels = collectAllPanels(state.workspaces, p =>
+            getPanelBaseTitle(p.contentId, state.dockItems) === baseTitle
+          )
+          const indexedModeActive = existingSameTitlePanels.length > 0
+          let kindTitleCounters = state.kindTitleCounters
+          let newPanelTitleIndex: number | undefined
+
+          let workspacesForLayout = [...state.workspaces]
+          if (indexedModeActive) {
+            const currentCounter = kindTitleCounters[baseTitle] ?? 0
+            const { workspaces: indexed, nextCounter } = activateIndexedMode(workspacesForLayout, baseTitle, state.dockItems, currentCounter)
+            workspacesForLayout = indexed
+            newPanelTitleIndex = nextCounter + 1
+            kindTitleCounters = { ...kindTitleCounters, [baseTitle]: nextCounter + 1 }
+          }
+
           const newPanel: PanelNode = {
             id: newPanelId,
             sessionId: newPanelId,
@@ -560,34 +902,24 @@ export const useIDEStore = create<IDEState>()(
             tabProjects: tabProjectId ? { [contentId]: tabProjectId } : undefined,
             kind,
             projectId: resolvedProjectId,
+            titleIndex: newPanelTitleIndex,
           }
           let newLayout: LayoutNode
+          const wsAfterIndex = workspacesForLayout[wsIndex]
 
-          if (!ws.layout) {
+          if (!wsAfterIndex.layout) {
             newLayout = newPanel
           } else if (targetPanelId && position) {
-            newLayout = replaceNode(ws.layout, targetPanelId, targetNode => {
+            newLayout = replaceNode(wsAfterIndex.layout, targetPanelId, targetNode => {
               const direction: SplitDirection =
                 position === 'left' || position === 'right' ? 'horizontal' : 'vertical'
               const isFirst = position === 'left' || position === 'top'
-              const t = targetNode as PanelNode
-              const innerPanel: PanelNode = {
-                ...t,
-                id: crypto.randomUUID(),
-                sessionId: t.sessionId ?? t.id,
-              }
-              const splitNode: SplitNode = {
-                id: t.id,
-                type: 'split',
-                direction,
-                children: isFirst ? [newPanel, innerPanel] : [innerPanel, newPanel],
-              }
-              return splitNode
+              return makeSplit(targetNode as PanelNode, newPanel, direction, isFirst)
             })
           } else {
-            const placement = findPlacement(ws.layout)
+            const placement = findPlacement(wsAfterIndex.layout)
             if (placement.kind === 'split-group') {
-              newLayout = replaceNode(ws.layout, placement.groupId, groupNode => ({
+              newLayout = replaceNode(wsAfterIndex.layout, placement.groupId, groupNode => ({
                 // Reuse groupNode's id so its parent keeps saved sizes
                 id: groupNode.id,
                 type: 'split',
@@ -600,26 +932,14 @@ export const useIDEStore = create<IDEState>()(
                 ],
               }))
             } else {
-              newLayout = replaceNode(ws.layout, placement.panelId, targetNode => {
-                const t = targetNode as PanelNode
-                const innerPanel: PanelNode = {
-                  ...t,
-                  id: crypto.randomUUID(),
-                  sessionId: t.sessionId ?? t.id,
-                }
-                return {
-                  id: t.id,
-                  type: 'split',
-                  direction: placement.direction,
-                  children: [innerPanel, newPanel],
-                }
-              })
+              newLayout = replaceNode(wsAfterIndex.layout, placement.panelId, targetNode =>
+                makeSplit(targetNode as PanelNode, newPanel, placement.direction, false)
+              )
             }
           }
 
-          const newWorkspaces = [...state.workspaces]
-          newWorkspaces[wsIndex] = { ...ws, layout: newLayout }
-          return { workspaces: newWorkspaces, newFileIndex }
+          workspacesForLayout[wsIndex] = { ...wsAfterIndex, layout: newLayout }
+          return { workspaces: workspacesForLayout, newFileIndex, kindTitleCounters }
         }),
       openFile: (path, projectId) => {
         useIDEStore.getState().addPanel(`file:${path}`, undefined, undefined, projectId)
@@ -722,27 +1042,54 @@ export const useIDEStore = create<IDEState>()(
 
           const panel = findPanel(ws.layout, (_, n) => n.id === panelId)
           if (!panel || panel.type !== 'panel') return state
+          // Resolve the real contentId for title tracking (tabContentIds maps sessionId → contentId for terminal tabs)
+          const resolvedContentId = panel.tabContentIds?.[contentId] ?? contentId
+          const closedBaseTitle = getPanelBaseTitle(resolvedContentId, state.dockItems)
 
           const newTabs = panel.tabs.filter(t => t !== contentId)
+          let baseWorkspaces: typeof state.workspaces
           if (newTabs.length === 0) {
             // No tabs left — remove the panel entirely
             const newLayout = removeNodeFromTree(ws.layout, panelId)
-            const newWorkspaces = [...state.workspaces]
-            newWorkspaces[wsIndex] = { ...ws, layout: newLayout }
-            return { workspaces: newWorkspaces }
+            baseWorkspaces = [...state.workspaces]
+            baseWorkspaces[wsIndex] = { ...ws, layout: newLayout }
+          } else {
+            const rawNewContentId =
+              panel.contentId === contentId
+                ? (newTabs[Math.max(0, newTabs.indexOf(contentId) - 1)] ?? newTabs[0])
+                : panel.contentId
+            // When only one tab remains, ungroup: restore original contentId and sessionId,
+            // clear the session/content/titleIndex maps that were only needed for multi-tab mode.
+            let updatedPanel: PanelNode
+            if (newTabs.length === 1) {
+              const survivingTabId = newTabs[0]
+              const restoredContentId = panel.tabContentIds?.[survivingTabId] ?? survivingTabId
+              const restoredSessionId = panel.tabSessions?.[survivingTabId] ?? panel.sessionId
+              const restoredTitleIndex = panel.tabTitleIndices?.[survivingTabId] ?? panel.titleIndex
+              updatedPanel = {
+                ...panel,
+                contentId: restoredContentId,
+                tabs: [restoredContentId],
+                sessionId: restoredSessionId,
+                tabSessions: undefined,
+                tabContentIds: undefined,
+                tabTitleIndices: undefined,
+                titleIndex: restoredTitleIndex,
+              }
+            } else {
+              updatedPanel = { ...panel, contentId: rawNewContentId, tabs: newTabs }
+            }
+            const newLayout = replaceNode(ws.layout, panelId, n =>
+              n.type === 'panel' ? updatedPanel : n,
+            )
+            baseWorkspaces = [...state.workspaces]
+            baseWorkspaces[wsIndex] = { ...ws, layout: newLayout }
           }
 
-          const newContentId =
-            panel.contentId === contentId
-              ? (newTabs[Math.max(0, newTabs.indexOf(contentId) - 1)] ?? newTabs[0])
-              : panel.contentId
-
-          const newLayout = replaceNode(ws.layout, panelId, n =>
-            n.type === 'panel' ? { ...n, contentId: newContentId, tabs: newTabs } : n,
-          )
-          const newWorkspaces = [...state.workspaces]
-          newWorkspaces[wsIndex] = { ...ws, layout: newLayout }
-          return { workspaces: newWorkspaces }
+          // Reconcile indexed title mode for the closed tab's base title
+          const { workspaces: finalWorkspaces, kindTitleCounters } =
+            reconcileTitleIndicesAfterRemoval(baseWorkspaces, closedBaseTitle, state.dockItems, state.kindTitleCounters)
+          return { workspaces: finalWorkspaces, kindTitleCounters }
         }),
       setKindBehavior: (kind, behavior) =>
         set(state => ({
@@ -754,6 +1101,11 @@ export const useIDEStore = create<IDEState>()(
           if (wsIndex === -1) return state
           const ws = state.workspaces[wsIndex]
           if (!ws.layout) return state
+
+          // Capture base title of the panel being removed before removal
+          const removedPanel = findPanel(ws.layout, (_, n) => n.id === panelId)
+          const removedBaseTitle = removedPanel ? getPanelBaseTitle(removedPanel.contentId, state.dockItems) : undefined
+
           const newLayout = removeNodeFromTree(ws.layout, panelId)
           const newWorkspaces = [...state.workspaces]
           newWorkspaces[wsIndex] = { ...ws, layout: newLayout }
@@ -764,7 +1116,15 @@ export const useIDEStore = create<IDEState>()(
           const panelSizes = Object.fromEntries(
             Object.entries(state.panelSizes).filter(([id]) => liveIds.has(id)),
           )
-          return { workspaces: newWorkspaces, panelSizes }
+          // Reconcile indexed title mode for the removed base title
+          let finalWorkspaces = newWorkspaces
+          let kindTitleCounters = state.kindTitleCounters
+          if (removedBaseTitle) {
+            const r = reconcileTitleIndicesAfterRemoval(newWorkspaces, removedBaseTitle, state.dockItems, kindTitleCounters)
+            finalWorkspaces = r.workspaces
+            kindTitleCounters = r.kindTitleCounters
+          }
+          return { workspaces: finalWorkspaces, panelSizes, kindTitleCounters }
         }),
       updateLayout: (workspaceId, layout) =>
         set(state => ({

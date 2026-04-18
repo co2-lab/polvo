@@ -61,6 +61,9 @@ type Config struct {
 	// SkillExtractor is optional. When set, skills are extracted at the end
 	// of each work item and stored in the memory store for future sessions.
 	SkillExtractor *skill.Extractor
+	// ContextWindow is the model context window size in tokens.
+	// When 0, the value from the known model table is used as a default.
+	ContextWindow int
 }
 
 // ProviderOption is a selectable provider+model pair for the /model picker.
@@ -133,11 +136,12 @@ type providerRetryMsg struct {
 	deadline    time.Time
 	errText     string // original error message
 }
-type retryTickMsg struct{}
+type retryTickMsg struct{ id int }
 type turnSummaryDoneMsg struct {
-	turnIdx int
-	summary string
-	err     error
+	turnIdx       int
+	summary       string
+	err           error
+	userRequested bool // true = user explicitly dismissed; false = inline auto-summary
 }
 type addProviderDoneMsg struct {
 	opts []ProviderOption
@@ -264,6 +268,9 @@ type historyEntry struct {
 	// token/cost metadata (only set for "assistant" role)
 	tokens provider.TokenUsage
 	cost   float64
+	// calls holds the raw tool entries for "tools" role entries,
+	// so they can be re-rendered when showTools is toggled.
+	calls  []toolEntry
 }
 
 type model struct {
@@ -296,10 +303,12 @@ type model struct {
 	retryMaxAttempts     int
 	retryErrText         string // original error message from the first retry trigger
 	retryCancelledByUser bool
+	retryTickID          int // incremented on each new retry to invalidate stale ticks
 	startedAt     time.Time
 	// live token accumulation (updated per turn via agentDoneMsg)
-	liveTokens int
-	liveCost   float64
+	liveTokens       int
+	liveCost         float64
+	lastPromptTokens int // PromptTokens from the last API response (real context size)
 
 	confirmingExit bool
 
@@ -327,8 +336,10 @@ type model struct {
 	pendingSuspend agent.SuspendSignal
 
 	// turn mark state
-	turnSelectMode bool
-	selectedTurn   int // -1 = none
+	turnSelectMode  bool
+	selectedTurn    int // -1 = none
+	turnMarks       map[int]agent.TurnMetadata // marks indexed by TUI turn index (persists across agent runs)
+	convTurnOffset  int // m.turn value at the start of the current agent run
 	conv           *agent.Conversation
 	ckptStore      checkpoint.Saver
 	ckptSessionID  string
@@ -474,12 +485,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case tea.KeyUp:
 				if m.selectedTurn > 0 {
 					m.selectedTurn--
+					m.rebuildHistory()
 					m.refreshViewport()
 				}
 				return m, nil
 			case tea.KeyDown:
 				if m.selectedTurn < totalTurns-1 {
 					m.selectedTurn++
+					m.rebuildHistory()
 					m.refreshViewport()
 				}
 				return m, nil
@@ -488,37 +501,46 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "k":
 					if m.selectedTurn > 0 {
 						m.selectedTurn--
+						m.rebuildHistory()
 						m.refreshViewport()
 					}
 					return m, nil
 				case "j":
 					if m.selectedTurn < totalTurns-1 {
 						m.selectedTurn++
+						m.rebuildHistory()
 						m.refreshViewport()
 					}
 					return m, nil
 				case "d":
-					// Dismiss: set mark and trigger async summary generation.
-					if m.selectedTurn >= 0 && m.conv != nil {
+					// Toggle dismiss: remove mark if already dismissed, otherwise set it.
+					// Stay in turn select mode so the user can mark multiple turns.
+					if m.selectedTurn >= 0 {
 						turnIdx := m.selectedTurn
-						m.conv.SetMark(turnIdx, agent.TurnMarkDismissed, "")
-						m.turnSelectMode = false
-						m.selectedTurn = -1
-						m.rebuildHistory()
-						m.refreshViewport()
-						return m, m.generateTurnSummary(m.ctx, turnIdx)
+						if m.getTurnMark(turnIdx).Mark == agent.TurnMarkDismissed {
+							m.setTurnMark(turnIdx, agent.TurnMarkNone, "")
+							m.rebuildHistory()
+							m.refreshViewport()
+						} else {
+							m.setTurnMark(turnIdx, agent.TurnMarkDismissed, "")
+							m.rebuildHistory()
+							m.refreshViewport()
+							return m, m.generateTurnSummary(m.ctx, turnIdx)
+						}
 					}
 					return m, nil
 				case "u":
-					// Mark as useful.
-					if m.selectedTurn >= 0 && m.conv != nil {
-						m.conv.SetMark(m.selectedTurn, agent.TurnMarkUseful, "")
+					// Toggle useful mark. Stay in turn select mode.
+					if m.selectedTurn >= 0 {
+						if m.getTurnMark(m.selectedTurn).Mark == agent.TurnMarkUseful {
+							m.setTurnMark(m.selectedTurn, agent.TurnMarkNone, "")
+						} else {
+							m.setTurnMark(m.selectedTurn, agent.TurnMarkUseful, "")
+						}
 						m.persistTurnMarks()
+						m.rebuildHistory()
+						m.refreshViewport()
 					}
-					m.turnSelectMode = false
-					m.selectedTurn = -1
-					m.rebuildHistory()
-					m.refreshViewport()
 					return m, nil
 				case "c":
 					m.turnSelectMode = false
@@ -608,6 +630,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case tea.KeyCtrlT:
 			m.showTools = !m.showTools
+			m.rebuildHistory()
 			m.refreshViewport()
 			return m, nil
 
@@ -652,14 +675,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if !m.retryDeadline.IsZero() && m.cancelRun != nil {
 				m.cancelRun()
+				m.cancelRun = nil
 				errMsg := retryErrorMsg(m.retryErrText, m.retryAttempt, m.retryMaxAttempts, true)
 				m.retryDeadline = time.Time{}
-				m.retryCancelledByUser = true
-				m.status = "cancelled"
+				m.retryTickID++ // discard pending ticks
+				m.agentRunning = false
+				m.retryCancelledByUser = false
+				m.retryAttempt = 0
+				m.retryErrText = ""
+				m.status = "ready"
 				m.appendHistory("error", errMsg, provider.TokenUsage{}, 0)
 				m.refreshViewport()
 				m.viewport.GotoBottom()
-				return m, nil
+				return m, textarea.Blink
 			}
 
 		case tea.KeyTab:
@@ -764,14 +792,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.retryErrText == "" {
 			m.retryErrText = msg.errText
 		}
+		m.retryTickID++ // invalidate any previously scheduled ticks
+		tickID := m.retryTickID
 		secs := int(time.Until(m.retryDeadline).Seconds()) + 1
 		m.status = fmt.Sprintf("rate limit — retrying in %ds (attempt %d/%d)…", secs, m.retryAttempt, m.retryMaxAttempts)
 		m.refreshViewport()
-		cmds = append(cmds, tea.Tick(time.Second, func(time.Time) tea.Msg { return retryTickMsg{} }))
+		cmds = append(cmds, tea.Tick(time.Second, func(time.Time) tea.Msg { return retryTickMsg{id: tickID} }))
 
 	case retryTickMsg:
-		if m.retryDeadline.IsZero() {
-			break
+		if m.retryDeadline.IsZero() || msg.id != m.retryTickID {
+			break // stale tick from a previous retry cycle — discard
 		}
 		remaining := time.Until(m.retryDeadline)
 		if remaining <= 0 {
@@ -780,7 +810,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			secs := int(remaining.Seconds()) + 1
 			m.status = fmt.Sprintf("rate limit — retrying in %ds (attempt %d/%d)…", secs, m.retryAttempt, m.retryMaxAttempts)
-			cmds = append(cmds, tea.Tick(time.Second, func(time.Time) tea.Msg { return retryTickMsg{} }))
+			tickID := m.retryTickID
+			cmds = append(cmds, tea.Tick(time.Second, func(time.Time) tea.Msg { return retryTickMsg{id: tickID} }))
 		}
 		m.refreshViewport()
 
@@ -806,21 +837,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport()
 
 	case turnSummaryDoneMsg:
-		if msg.err == nil && msg.summary != "" && m.conv != nil {
-			m.conv.SetMark(msg.turnIdx, agent.TurnMarkDismissed, msg.summary)
-			// Update the historyEntry summary for rendering.
-			for i := range m.historyEntries {
-				if m.historyEntries[i].turnIdx == msg.turnIdx {
-					m.historyEntries[i].text = msg.summary // store summary as text for dismissed entry
+		if msg.err == nil && msg.summary != "" {
+			if msg.userRequested {
+				// User explicitly dismissed this turn — mark it collapsed.
+				m.setTurnMark(msg.turnIdx, agent.TurnMarkDismissed, msg.summary)
+				m.persistTurnMarks()
+			} else {
+				// Inline auto-summary: store the text for context-compression only,
+				// do NOT visually collapse the turn.
+				if m.turnMarks == nil {
+					m.turnMarks = make(map[int]agent.TurnMetadata)
 				}
+				existing := m.getTurnMark(msg.turnIdx)
+				existing.Summary = msg.summary
+				m.turnMarks[msg.turnIdx] = existing
 			}
-			m.persistTurnMarks()
-			// Track latest summary for skill extraction at work-item end.
 			m.lastWorkItemSummary = msg.summary
-		} else if msg.err != nil && m.conv != nil {
-			// Summary failed — keep the mark but clear it so content is shown.
-			m.conv.SetMark(msg.turnIdx, agent.TurnMarkNone, "")
+		} else if msg.err != nil && msg.userRequested {
+			// Summary failed for user-requested dismiss — clear mark so content shows.
+			m.setTurnMark(msg.turnIdx, agent.TurnMarkNone, "")
 		}
+		m.rebuildHistory()
 		m.refreshViewport()
 
 	case agentSuspendedMsg:
@@ -848,6 +885,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.retryAttempt = 0
 		m.retryErrText = ""
 		m.liveTokens += msg.tokensUsed.TotalTokens
+		if msg.tokensUsed.PromptTokens > 0 {
+			m.lastPromptTokens = msg.tokensUsed.PromptTokens
+		}
 		m.liveCost += msg.costUSD
 		if len(m.toolCalls) > 0 {
 			m.appendToolSummary()
@@ -1032,11 +1072,28 @@ func (m model) renderStatusBar() string {
 		}
 		ready := styleStatusBg.Render("● Ready")
 		keys := styleDim.Render(" ↑↓ scroll  Ctrl+T tools  Ctrl+X marks  Ctrl+D exit ")
-		pad := m.width - lipgloss.Width(ready) - lipgloss.Width(keys)
+		// Show context usage on right side when there are completed turns.
+		var ctxInfo string
+		if m.turn > 0 {
+			inCtx, pct, saved, ctxWin := m.contextStats()
+			if inCtx > 0 {
+				if ctxWin > 0 {
+					ctxInfo = styleDim.Render(" ctx: ") + styleMuted.Render(fmt.Sprintf("%d%% · %s/%s", pct, fmtTokens(inCtx), fmtTokens(ctxWin)))
+				} else {
+					ctxInfo = styleDim.Render(" ctx: ") + styleMuted.Render(fmtTokens(inCtx))
+				}
+				if saved > 0 {
+					ctxInfo += styleDim.Render(" saved: ") + styleSuccess.Render(fmtTokens(saved))
+				}
+				ctxInfo += " "
+			}
+		}
+		right := ctxInfo + keys
+		pad := m.width - lipgloss.Width(ready) - lipgloss.Width(right)
 		if pad < 0 {
 			pad = 0
 		}
-		return ready + strings.Repeat(" ", pad) + keys
+		return ready + strings.Repeat(" ", pad) + right
 	}
 }
 
@@ -1179,6 +1236,11 @@ func (m *model) startAgent(prompt string) tea.Cmd {
 		filepath.Join(homeDir, ".polvo", "microagents"),
 	)
 
+	// Capture the current TUI turn count so loop-relative turn indices can be
+	// translated to global TUI turn indices in callbacks.
+	tuiTurnOffset := m.turn
+	m.convTurnOffset = m.turn
+
 	model := m.cfg.Model
 
 	system := m.cfg.System
@@ -1229,7 +1291,8 @@ func (m *model) startAgent(prompt string) tea.Cmd {
 			}
 		},
 		OnTurnSummary: func(turnIdx int, summary string) {
-			prog.Send(turnSummaryDoneMsg{turnIdx: turnIdx, summary: summary})
+			// turnIdx is 0-based within this run; add the TUI turn offset.
+			prog.Send(turnSummaryDoneMsg{turnIdx: tuiTurnOffset + turnIdx, summary: summary})
 		},
 		OnRetry: func(err error, attempt int, delay time.Duration) {
 			prog.Send(providerRetryMsg{
@@ -1248,6 +1311,15 @@ func (m *model) startAgent(prompt string) tea.Cmd {
 	m.conv = l.Conv()
 	m.ckptStore = ckptStore
 	m.ckptSessionID = ckptSessionID
+
+	// Propagate any existing turn marks from previous runs into the new conversation.
+	// TUI turn index = tuiTurnOffset + conv turn index, so conv index = TUI index - tuiTurnOffset.
+	for tuiIdx, meta := range m.turnMarks {
+		convIdx := tuiIdx - tuiTurnOffset
+		if convIdx >= 0 {
+			m.conv.SetMark(convIdx, meta.Mark, meta.Summary)
+		}
+	}
 
 	// Resolve @@task[...] / @@question[...] references before sending to the model.
 	var resolver *session.Resolver
@@ -1390,10 +1462,12 @@ func (m *model) startWorkItem(cmd string) tea.Cmd {
 	m.turn = 0
 	m.liveTokens = 0
 	m.liveCost = 0
+	m.lastPromptTokens = 0
 	m.toolCalls = nil
 	m.currentDelta = ""
 	m.historyEntries = nil
 	m.conv = nil
+	m.turnMarks = nil
 	m.turnSelectMode = false
 	m.selectedTurn = -1
 
@@ -1412,11 +1486,7 @@ func (m *model) startWorkItem(cmd string) tea.Cmd {
 // turn asynchronously, using the dedicated summary model when configured or the
 // main model otherwise.
 func (m *model) generateTurnSummary(ctx context.Context, turnIdx int) tea.Cmd {
-	if m.conv == nil {
-		return nil
-	}
-	userText := m.conv.TurnUserContent(turnIdx)
-	assistantText := m.conv.TurnAssistantContent(turnIdx)
+	userText, assistantText := m.turnTexts(turnIdx)
 	if userText == "" && assistantText == "" {
 		return nil
 	}
@@ -1430,7 +1500,7 @@ func (m *model) generateTurnSummary(ctx context.Context, turnIdx int) tea.Cmd {
 
 	return func() tea.Msg {
 		summary, err := agent.SummarizeTurn(ctx, p, mdl, userText, assistantText)
-		return turnSummaryDoneMsg{turnIdx: turnIdx, summary: summary, err: err}
+		return turnSummaryDoneMsg{turnIdx: turnIdx, summary: summary, err: err, userRequested: true}
 	}
 }
 
@@ -1453,12 +1523,11 @@ func (m model) buildTurnHistoryText() string {
 
 // persistTurnMarks saves all current turn marks to the checkpoint store.
 func (m *model) persistTurnMarks() {
-	if m.ckptStore == nil || m.ckptSessionID == "" || m.conv == nil {
+	if m.ckptStore == nil || m.ckptSessionID == "" {
 		return
 	}
 	var records []checkpoint.TurnMarkRecord
-	for i := 0; i < m.conv.TurnCount(); i++ {
-		meta := m.conv.GetMark(i)
+	for i, meta := range m.turnMarks {
 		if meta.Mark != agent.TurnMarkNone {
 			records = append(records, checkpoint.TurnMarkRecord{
 				TurnIndex: i,
@@ -1468,6 +1537,50 @@ func (m *model) persistTurnMarks() {
 		}
 	}
 	_ = m.ckptStore.SaveTurnMarks(m.ckptSessionID, records)
+}
+
+// setTurnMark sets a mark in the TUI-local turnMarks map (indexed by TUI turn index).
+// Also propagates to m.conv when available for context-compression.
+func (m *model) setTurnMark(idx int, mark agent.TurnMark, summary string) {
+	if m.turnMarks == nil {
+		m.turnMarks = make(map[int]agent.TurnMetadata)
+	}
+	m.turnMarks[idx] = agent.TurnMetadata{Index: idx, Mark: mark, Summary: summary}
+	// Propagate to the current conversation using the conv-relative index.
+	if m.conv != nil {
+		convIdx := idx - m.convTurnOffset
+		if convIdx >= 0 {
+			m.conv.SetMark(convIdx, mark, summary)
+		}
+	}
+}
+
+// getTurnMark returns the mark for a TUI turn index.
+func (m *model) getTurnMark(idx int) agent.TurnMetadata {
+	if m.turnMarks == nil {
+		return agent.TurnMetadata{Index: idx}
+	}
+	if meta, ok := m.turnMarks[idx]; ok {
+		return meta
+	}
+	return agent.TurnMetadata{Index: idx}
+}
+
+// turnTexts returns the user and assistant text for a TUI turn index
+// by scanning historyEntries (works across multiple agent runs).
+func (m *model) turnTexts(idx int) (userText, assistantText string) {
+	for _, e := range m.historyEntries {
+		if e.turnIdx != idx {
+			continue
+		}
+		switch e.role {
+		case "user":
+			userText = e.text
+		case "assistant":
+			assistantText = e.text
+		}
+	}
+	return
 }
 
 // ── history rendering ─────────────────────────────────────────────────────────
@@ -1482,6 +1595,9 @@ func (m *model) appendHistory(role, text string, tokens provider.TokenUsage, cos
 		turnIdx = m.turn
 	case "assistant":
 		// This closes the turn that started with turn m.turn.
+		turnIdx = m.turn
+	case "tools":
+		// Tool entries belong to the current turn.
 		turnIdx = m.turn
 	}
 	m.historyEntries = append(m.historyEntries, historyEntry{
@@ -1534,8 +1650,26 @@ func (m *model) appendToolSummary() {
 	if len(m.toolCalls) == 0 {
 		return
 	}
-	text := m.renderToolList(m.toolCalls, false)
-	m.appendHistory("tools", text, provider.TokenUsage{}, 0)
+	// Store raw calls so renderEntry can re-render when showTools is toggled.
+	calls := make([]toolEntry, len(m.toolCalls))
+	copy(calls, m.toolCalls)
+	m.historyEntries = append(m.historyEntries, historyEntry{
+		role:    "tools",
+		turnIdx: m.turn,
+		calls:   calls,
+	})
+	// Also append to the rendered history string.
+	w := m.width - 2
+	if w < 20 {
+		w = 20
+	}
+	label := styleSystem.Render("Tools Used")
+	text := m.renderToolList(calls, false)
+	line := styleToolBlock.Width(w).Render(label + "\n" + text)
+	if m.history != "" {
+		m.history += "\n"
+	}
+	m.history += line
 }
 
 // renderToolList renders the tool call list for display.
@@ -1604,8 +1738,8 @@ func (m *model) rebuildHistory() {
 	for _, e := range m.historyEntries {
 		var line string
 
-		if e.turnIdx >= 0 && m.conv != nil {
-			meta := m.conv.GetMark(e.turnIdx)
+		if e.turnIdx >= 0 {
+			meta := m.getTurnMark(e.turnIdx)
 			dismissed := meta.Mark == agent.TurnMarkDismissed
 			useful := meta.Mark == agent.TurnMarkUseful
 			selected := m.turnSelectMode && m.selectedTurn == e.turnIdx
@@ -1619,18 +1753,28 @@ func (m *model) rebuildHistory() {
 				if summary == "" {
 					summary = "generating summary…"
 				}
-				stub := styleDim.Render(fmt.Sprintf("[turn %d dismissed · %s]", e.turnIdx+1, truncate(summary, 60)))
-				line = styleDismissedBlock.Width(w).Render(stub)
+				if selected {
+					stub := styleWarning.Render("▶ ") + styleDim.Render(fmt.Sprintf("[turn %d dismissed · %s · d=restore]", e.turnIdx+1, truncate(summary, 50)))
+					line = styleSelectedBlock.Width(w).Render(stub)
+				} else {
+					stub := styleDim.Render(fmt.Sprintf("[turn %d dismissed · %s]", e.turnIdx+1, truncate(summary, 60)))
+					line = styleDismissedBlock.Width(w).Render(stub)
+				}
 			} else {
 				// Render normally, with mark-aware style.
 				line = m.renderEntry(e, w)
-				if selected {
+				if selected && useful {
+					// Already useful and selected: thick border (selection) + star icon.
 					line = styleSelectedBlock.Width(w).Render(
-						styleWarning.Render("▶ ") + m.renderEntryInner(e),
+						indentLines(m.renderEntryInner(e), styleWarning.Render("★ "), "  "),
+					)
+				} else if selected {
+					line = styleSelectedBlock.Width(w).Render(
+						indentLines(m.renderEntryInner(e), styleWarning.Render("▶ "), "  "),
 					)
 				} else if useful {
 					line = styleUsefulBlock.Width(w).Render(
-						styleWarning.Render("★ ") + m.renderEntryInner(e),
+						indentLines(m.renderEntryInner(e), styleWarning.Render("★ "), "  "),
 					)
 				}
 			}
@@ -1661,6 +1805,12 @@ func (m *model) renderEntryInner(e historyEntry) string {
 			body += "\n" + styleDim.Render("✦ "+footer)
 		}
 		return body
+	case "tools":
+		text := e.text
+		if len(e.calls) > 0 {
+			text = m.renderToolList(e.calls, false)
+		}
+		return styleSystem.Render("Tools Used") + "\n" + text
 	default:
 		return e.text
 	}
@@ -1691,7 +1841,11 @@ func (m *model) renderEntry(e historyEntry, w int) string {
 		return styleErrorBlock.Width(w).Render(styleDim.Render("· " + e.text))
 	case "tools":
 		label := styleSystem.Render("Tools Used")
-		return styleToolBlock.Width(w).Render(label + "\n" + e.text)
+		text := e.text
+		if len(e.calls) > 0 {
+			text = m.renderToolList(e.calls, false)
+		}
+		return styleToolBlock.Width(w).Render(label + "\n" + text)
 	}
 	return e.text
 }
@@ -2050,10 +2204,86 @@ func friendlyError(msg string) string {
 	return msg
 }
 
+// contextStats returns context token usage, percentage of the context window used,
+// and tokens saved by dismissed marks.
+//
+// inContext  = real PromptTokens from last API response (0 if no response yet).
+// pct        = percentage of context window used (0 if context window unknown).
+// saved      = estimated tokens saved by dismissed turns.
+// contextWin = effective context window in tokens (cfg override → model table → 0).
+func (m model) contextStats() (inContext, pct, saved, contextWin int) {
+	// Prefer the real PromptTokens from the last API response.
+	inContext = m.lastPromptTokens
+	// Fall back to estimation if no real value yet.
+	if inContext == 0 && m.conv != nil {
+		inContext = provider.EstimateTokens(m.conv.Messages(), "")
+	}
+
+	// Resolve effective context window: config override takes priority.
+	contextWin = m.cfg.ContextWindow
+	if contextWin == 0 {
+		apiKey := ""
+		if kp, ok := m.cfg.Provider.(provider.KeyedProvider); ok {
+			apiKey = kp.APIKey()
+		}
+		contextWin = provider.ContextWindowForModelWithKey(m.cfg.Model, apiKey)
+	}
+	if contextWin > 0 && inContext > 0 {
+		pct = inContext * 100 / contextWin
+	}
+
+	// Compute savings only when dismissed marks exist.
+	if m.conv != nil {
+		hasDismissed := false
+		for i := 0; i < m.conv.TurnCount(); i++ {
+			if m.conv.GetMark(i).Mark == agent.TurnMarkDismissed {
+				hasDismissed = true
+				break
+			}
+		}
+		if hasDismissed {
+			var rawMsgs []provider.Message
+			for _, e := range m.historyEntries {
+				switch e.role {
+				case "user":
+					rawMsgs = append(rawMsgs, provider.Message{Role: "user", Content: e.text})
+				case "assistant":
+					rawMsgs = append(rawMsgs, provider.Message{Role: "assistant", Content: e.text})
+				case "tools":
+					for _, tc := range e.calls {
+						rawMsgs = append(rawMsgs, provider.Message{Role: "tool", Content: tc.output})
+					}
+				}
+			}
+			full := provider.EstimateTokens(rawMsgs, "")
+			compressed := provider.EstimateTokens(m.conv.Messages(), "")
+			if full > compressed {
+				saved = full - compressed
+			}
+		}
+	}
+	return
+}
+
 func truncate(s string, n int) string {
 	runes := []rune(s)
 	if len(runes) <= n {
 		return s
 	}
 	return string(runes[:n]) + "…"
+}
+
+// indentLines prefixes the first line with `first` and all subsequent lines
+// with `rest`, keeping multi-line blocks visually aligned under the icon.
+func indentLines(s, first, rest string) string {
+	lines := strings.Split(s, "\n")
+	var sb strings.Builder
+	for i, line := range lines {
+		if i == 0 {
+			sb.WriteString(first + line)
+		} else {
+			sb.WriteString("\n" + rest + line)
+		}
+	}
+	return sb.String()
 }

@@ -8,35 +8,79 @@ import (
 )
 
 // secretPattern is a compiled regex plus its replacement label.
+// If skipValue is set, matches whose captured value (text after the key=) looks
+// like a code expression rather than a real credential are suppressed.
 type secretPattern struct {
-	re    *regexp.Regexp
-	label string
+	re        *regexp.Regexp
+	label     string
+	skipValue bool // if true, apply isFalsePositiveValue filter to the matched value
 }
+
+// isFalsePositiveMatch returns true when the full regex match looks like
+// source-code rather than a real credential assignment. Handles:
+//   - function/method call as value:  apiKey = kp.GetKey()
+//   - the entire match is a quoted string (doc/format comment), not an assignment
+//   - environment-variable reference: api_key = $MY_VAR
+func isFalsePositiveMatch(match string) bool {
+	// Find the assignment operator (= or :) to split key from value.
+	// We need the LAST = or : that is not inside quotes.
+	// Simple heuristic: find first = (preferred) then fall back to first :.
+	sepIdx := strings.Index(match, "=")
+	if sepIdx < 0 {
+		sepIdx = strings.Index(match, ":")
+	}
+
+	var value string
+	if sepIdx >= 0 {
+		value = strings.TrimSpace(match[sepIdx+1:])
+	} else {
+		value = strings.TrimSpace(match)
+	}
+
+	// If the entire match is a quoted string and the key word appears within
+	// the entire match is a quoted string — a doc/format string, not a credential.
+	trimmed := strings.TrimSpace(match)
+	if (strings.HasPrefix(trimmed, `"`) && strings.HasSuffix(trimmed, `"`)) ||
+		(strings.HasPrefix(trimmed, "`") && strings.HasSuffix(trimmed, "`")) {
+		return true
+	}
+
+	// Value is a function/method call.
+	if strings.Contains(value, "(") && strings.HasSuffix(strings.TrimRight(value, " \t"), ")") {
+		return true
+	}
+	// Value is an environment variable reference.
+	if strings.HasPrefix(value, "$") {
+		return true
+	}
+	return false
+}
+
 
 var secretPatterns = []secretPattern{
 	// Specific token formats first, before the generic token= pattern.
-	{regexp.MustCompile(`sk-[A-Za-z0-9]{48}`), "[OPENAI_KEY_REDACTED]"},
-	{regexp.MustCompile(`ghp_[A-Za-z0-9]{36}`), "[GITHUB_PAT_REDACTED]"},
-	{regexp.MustCompile(`gho_[A-Za-z0-9]{36}`), "[GITHUB_OAUTH_REDACTED]"},
-	{regexp.MustCompile(`xoxb-[0-9]+-[A-Za-z0-9]+`), "[SLACK_TOKEN_REDACTED]"},
-	{regexp.MustCompile(`AKIA[0-9A-Z]{16}`), "[AWS_ACCESS_KEY_REDACTED]"},
+	{regexp.MustCompile(`sk-[A-Za-z0-9]{48}`), "[OPENAI_KEY_REDACTED]", false},
+	{regexp.MustCompile(`ghp_[A-Za-z0-9]{36}`), "[GITHUB_PAT_REDACTED]", false},
+	{regexp.MustCompile(`gho_[A-Za-z0-9]{36}`), "[GITHUB_OAUTH_REDACTED]", false},
+	{regexp.MustCompile(`xoxb-[0-9]+-[A-Za-z0-9]+`), "[SLACK_TOKEN_REDACTED]", false},
+	{regexp.MustCompile(`AKIA[0-9A-Z]{16}`), "[AWS_ACCESS_KEY_REDACTED]", false},
 	// New patterns (Plan 45) — more specific first.
-	{regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`), "[JWT_REDACTED]"},
-	{regexp.MustCompile(`-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----`), "[PRIVATE_KEY_REDACTED]"},
-	{regexp.MustCompile(`(?:mongodb|postgres|mysql|redis)://[^@\s]+:[^@\s]+@[^\s]+`), "[DB_CONN_REDACTED]"},
-	{regexp.MustCompile(`[Bb]earer\s+[A-Za-z0-9\-._~+/]{20,}`), "[BEARER_TOKEN_REDACTED]"},
-	{regexp.MustCompile(`sk_live_[A-Za-z0-9]{24,}`), "[STRIPE_KEY_REDACTED]"},
-	{regexp.MustCompile(`SG\.[A-Za-z0-9_-]{22,}\.[A-Za-z0-9_-]{43,}`), "[SENDGRID_KEY_REDACTED]"},
-	{regexp.MustCompile(`(?i)(?:secret|private_key)\s*[=:]\s*\S{8,}`), "[SECRET_REDACTED]"},
+	{regexp.MustCompile(`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`), "[JWT_REDACTED]", false},
+	{regexp.MustCompile(`-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----`), "[PRIVATE_KEY_REDACTED]", false},
+	{regexp.MustCompile(`(?:mongodb|postgres|mysql|redis)://[^@\s]+:[^@\s]+@[^\s]+`), "[DB_CONN_REDACTED]", false},
+	{regexp.MustCompile(`[Bb]earer\s+[A-Za-z0-9\-._~+/]{20,}`), "[BEARER_TOKEN_REDACTED]", false},
+	{regexp.MustCompile(`sk_live_[A-Za-z0-9]{24,}`), "[STRIPE_KEY_REDACTED]", false},
+	{regexp.MustCompile(`SG\.[A-Za-z0-9_-]{22,}\.[A-Za-z0-9_-]{43,}`), "[SENDGRID_KEY_REDACTED]", false},
+	{regexp.MustCompile(`(?i)(?:secret|private_key)\s*[=:]\s*\S{8,}`), "[SECRET_REDACTED]", true},
 	// Key/value assignment patterns.
 	// Require a non-letter before the key name so camelCase identifiers like
 	// "needsAPIKey" or "apiKeyHint" don't match. Values must be ≥8 chars.
-	{regexp.MustCompile(`(?i)(?:^|[^A-Za-z])(aws_access_key_id|aws_secret_access_key)\s*[=:]\s*\S+`), "[AWS_KEY_REDACTED]"},
+	{regexp.MustCompile(`(?i)(?:^|[^A-Za-z])(aws_access_key_id|aws_secret_access_key)\s*[=:]\s*\S+`), "[AWS_KEY_REDACTED]", true},
 	// Also match plain "apikey" (no separator) with the same word-boundary guard.
-	{regexp.MustCompile(`(?i)(?:^|[^A-Za-z])(api[_-]?key|api[_-]?secret)\s*[=:]\s*\S{5,}`), "[API_KEY_REDACTED]"},
-	{regexp.MustCompile(`(?i)(token|bearer)\s*[=:]\s*[A-Za-z0-9._\-]{20,}`), "[TOKEN_REDACTED]"},
-	{regexp.MustCompile(`(?i)authorization\s*[=:]\s*\S+`), "[AUTH_REDACTED]"},
-	{regexp.MustCompile(`(?i)(?:^|[^A-Za-z])(password|passwd|pwd)\s*[=:]\s*\S{5,}`), "[PASSWORD_REDACTED]"},
+	{regexp.MustCompile(`(?i)(?:^|[^A-Za-z])(api[_-]?key|api[_-]?secret)\s*[=:]\s*\S{5,}`), "[API_KEY_REDACTED]", true},
+	{regexp.MustCompile(`(?i)(token|bearer)\s*[=:]\s*[A-Za-z0-9._\-]{20,}`), "[TOKEN_REDACTED]", true},
+	{regexp.MustCompile(`(?i)authorization\s*[=:]\s*\S+`), "[AUTH_REDACTED]", true},
+	{regexp.MustCompile(`(?i)(?:^|[^A-Za-z])(password|passwd|pwd)\s*[=:]\s*\S{5,}`), "[PASSWORD_REDACTED]", true},
 }
 
 // MaskResult holds the masked content and details of what was redacted.
@@ -76,6 +120,12 @@ func MaskSecretsDetailed(content string) MaskResult {
 		// Replace right-to-left to preserve offsets of earlier matches.
 		for i := len(locs) - 1; i >= 0; i-- {
 			loc := locs[i]
+			if p.skipValue {
+				matchText := masked[loc[0]:loc[1]]
+				if isFalsePositiveMatch(matchText) {
+					continue
+				}
+			}
 			redactions = append(redactions, Redaction{
 				Pattern: p.label,
 				Offset:  loc[0],

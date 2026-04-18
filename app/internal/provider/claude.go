@@ -38,7 +38,8 @@ func NewClaude(name, apiKey, defaultModel string) *ClaudeProvider {
 	}
 }
 
-func (p *ClaudeProvider) Name() string { return p.name }
+func (p *ClaudeProvider) Name() string   { return p.name }
+func (p *ClaudeProvider) APIKey() string { return p.apiKey }
 
 func (p *ClaudeProvider) Complete(ctx context.Context, req Request) (*Response, error) {
 	model := req.Model

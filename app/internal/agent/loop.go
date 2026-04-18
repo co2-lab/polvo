@@ -439,11 +439,25 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 		l.cfg.Hooks.RunBeforeModelCall(l.cfg.System, l.cfg.Model, turnCount)
 
 		// Use streaming when available and delta callback or EventStream is configured.
+		// usedStreaming is set to true when content was already delivered via
+		// OnTextDelta so we skip the redundant OnText call after the response.
+		var usedStreaming bool
 		if sp, ok := l.cfg.Provider.(provider.StreamProvider); ok && (l.cfg.OnTextDelta != nil || l.cfg.EventStream != nil) {
+			usedStreaming = true
+			// When InlineSummary is active, wrap the delta callback in a proxy
+			// that suppresses <summary>…</summary> blocks mid-stream so they
+			// never reach the UI.
+			var proxy *summaryDeltaProxy
+			if l.cfg.InlineSummary && l.cfg.OnTextDelta != nil {
+				proxy = newSummaryDeltaProxy(l.cfg.OnTextDelta)
+			}
+
 			resp, err = traceChat(ctx, l.cfg.Model, func(ctx context.Context) (*provider.ChatResponse, error) {
 				return sp.ChatStream(ctx, chatReq, func(event provider.StreamEvent) {
 					if event.Type == "text_delta" {
-						if l.cfg.OnTextDelta != nil {
+						if proxy != nil {
+							proxy.Write(event.TextDelta)
+						} else if l.cfg.OnTextDelta != nil {
 							l.cfg.OnTextDelta(event.TextDelta)
 						}
 						if l.cfg.EventStream != nil {
@@ -457,6 +471,9 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 					}
 				})
 			})
+			if proxy != nil {
+				proxy.Flush()
+			}
 		} else {
 			resp, err = traceChat(ctx, l.cfg.Model, func(ctx context.Context) (*provider.ChatResponse, error) {
 				return l.cfg.Provider.Chat(ctx, chatReq)
@@ -573,8 +590,9 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 		// Add assistant message to history
 		l.conv.AddAssistant(resp.Message)
 
-		// Fire text callback for any text content
-		if resp.Message.Content != "" && l.cfg.OnText != nil {
+		// Fire text callback for any text content — skip if streaming already
+		// delivered the content delta-by-delta via OnTextDelta.
+		if resp.Message.Content != "" && l.cfg.OnText != nil && !usedStreaming {
 			l.cfg.OnText(resp.Message.Content)
 		}
 		if resp.Message.Content != "" && l.cfg.EventStream != nil {

@@ -114,12 +114,9 @@ export function TerminalPanel({ sessionId = 'default', executable }: TerminalPan
             term.write(buf.slice(1))
             break
           case MSG_NEW:
-            // new session: send dimensions so PTY knows terminal size
             sendResize(term.cols, term.rows)
             break
           case MSG_RESUMED:
-            // scrollback already written to xterm — now trigger a resize so
-            // TUI apps (claude, etc.) redraw their interface cleanly
             sendResize(term.cols, term.rows)
             break
         }

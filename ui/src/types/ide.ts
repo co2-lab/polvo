@@ -1,7 +1,7 @@
 export type SplitDirection = 'horizontal' | 'vertical'
 
 // Kind determines grouping behavior
-export type PanelKind = 'editor' | 'terminal' | 'explorer' | 'agents' | 'log' | 'chat' | 'diff' | 'other'
+export type PanelKind = 'editor' | 'terminal' | 'explorer' | 'agents' | 'log' | 'chat' | 'diff' | 'ai' | 'other'
 
 // grouped = all items of same kind share one panel with tabs
 // new-panel = each item opens in its own panel
@@ -12,12 +12,18 @@ export interface PanelNode {
   type: 'panel'
   contentId: string   // active content
   tabs: string[]      // all open content ids in this panel
-  tabProjects?: Record<string, string>  // contentId → projectId
+  tabProjects?: Record<string, string>   // tabId → projectId
+  tabSessions?: Record<string, string>    // tabId → sessionId (for terminal tabs with unique session ids)
+  tabContentIds?: Record<string, string>  // tabId → original contentId (for labels when tabId is a sessionId)
+  tabTitleIndices?: Record<string, number> // tabId → permanent title index (for grouped terminal tabs)
   kind: PanelKind
   projectId?: string
   pinnedProjectId?: string
   /** Stable identity for terminal sessions — survives layout restructuring (id changes). */
   sessionId?: string
+  /** Permanent title index assigned when a second panel of the same kind is opened.
+   *  Once set it never changes, even if other panels of the same kind are closed. */
+  titleIndex?: number
 }
 
 export interface SplitNode {

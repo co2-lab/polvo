@@ -19,6 +19,7 @@ const KIND_ICONS: Record<PanelKind, React.ReactNode> = {
   log:      <ScrollText size={13} />,
   chat:     <MessageSquare size={13} />,
   diff:     <GitCompare size={13} />,
+  ai:       <TerminalIcon size={13} />,
   other:    <TerminalIcon size={13} />,
 }
 
