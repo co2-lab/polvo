@@ -60,6 +60,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Bump version in tauri.conf.json
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          jq --arg v "$VERSION" '.version = $v' desktop/tauri.conf.json > /tmp/tauri.conf.json
+          mv /tmp/tauri.conf.json desktop/tauri.conf.json
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
