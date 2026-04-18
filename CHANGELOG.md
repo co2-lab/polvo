@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.6 — 2026-04-18
+
+### Features
+
+- Add /clear and /compact commands ([#2f38d9a](https://github.com/co2-lab/polvo/commit/2f38d9ad848867867662b59eac3df5cf93e37a88))
+
 ## v0.3.5 — 2026-04-18
 
 ### Bug Fixes
