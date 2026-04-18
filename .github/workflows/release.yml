@@ -337,4 +337,5 @@ jobs:
           identifier: co2lab.Polvo
           token: ${{ secrets.WINGET_TOKEN }}
           release-tag: ${{ github.ref_name }}
+          fork-user: adrielcodeco
 
