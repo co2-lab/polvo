@@ -102,6 +102,17 @@ func (c *Conversation) TurnAssistantContent(idx int) string {
 	return ""
 }
 
+// ReplaceMessages replaces the internal message slice with the given messages,
+// clearing all turn boundaries and marks. Used by /compact to install a
+// condensed history produced by a Condenser.
+func (c *Conversation) ReplaceMessages(msgs []provider.Message) {
+	c.messages = make([]provider.Message, len(msgs))
+	copy(c.messages, msgs)
+	c.turnBoundaries = nil
+	c.marks = nil
+	c.openTurnStart = -1
+}
+
 // Messages returns the message history, substituting dismissed turns with
 // compact placeholder pairs to reduce context sent to the model.
 func (c *Conversation) Messages() []provider.Message {

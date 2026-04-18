@@ -147,6 +147,11 @@ type addProviderDoneMsg struct {
 	opts []ProviderOption
 	err  error
 }
+type compactDoneMsg struct {
+	tokensBefore int
+	tokensAfter  int
+	err          error
+}
 
 // addProviderExec implements tea.ExecCommand so the TUI hands the terminal to
 // AddProviderFn (the setup wizard) and then resumes.
@@ -618,6 +623,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.cancelRun()
 						return m, nil
 					}
+					// intercept /clear command
+					if prompt == "/clear" {
+						return m, m.clearConversation()
+					}
+					// intercept /compact command
+					if prompt == "/compact" {
+						return m, m.compactConversation()
+					}
 					// intercept /task and /question commands
 					if m.cfg.SessionManager != nil {
 						if strings.HasPrefix(prompt, "/task ") || strings.HasPrefix(prompt, "/question ") {
@@ -835,6 +848,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pickingModel = true
 		}
 		m.refreshViewport()
+
+	case compactDoneMsg:
+		m.status = "ready"
+		if msg.err != nil {
+			m.appendHistory("error", "compact: "+msg.err.Error(), provider.TokenUsage{}, 0)
+		} else {
+			saved := msg.tokensBefore - msg.tokensAfter
+			banner := fmt.Sprintf("[context compacted · %s → %s · saved %s tokens]",
+				fmtTokens(msg.tokensBefore), fmtTokens(msg.tokensAfter), fmtTokens(saved))
+			m.appendHistory("system", banner, provider.TokenUsage{}, 0)
+			m.turnMarks = nil
+			m.turnSelectMode = false
+			m.selectedTurn = -1
+		}
+		m.rebuildHistory()
+		m.refreshViewport()
+		m.viewport.GotoBottom()
 
 	case turnSummaryDoneMsg:
 		if msg.err == nil && msg.summary != "" {
@@ -1480,6 +1510,75 @@ func (m *model) startWorkItem(cmd string) tea.Cmd {
 }
 
 
+// ── /clear and /compact ───────────────────────────────────────────────────────
+
+// clearConversation resets the conversation state without starting a new agent run.
+// It mirrors the context-reset in startWorkItem but keeps the session alive.
+func (m *model) clearConversation() tea.Cmd {
+	m.history = ""
+	m.turn = 0
+	m.liveTokens = 0
+	m.liveCost = 0
+	m.lastPromptTokens = 0
+	m.toolCalls = nil
+	m.currentDelta = ""
+	m.historyEntries = nil
+	m.conv = nil
+	m.turnMarks = nil
+	m.turnSelectMode = false
+	m.selectedTurn = -1
+	m.appendHistory("system", "[conversation cleared]", provider.TokenUsage{}, 0)
+	m.rebuildHistory()
+	m.refreshViewport()
+	m.viewport.GotoBottom()
+	return nil
+}
+
+// compactConversation condenses the current conversation history using the
+// LLMSummaryCondenser when a summary provider is configured, or falls back to
+// AmortizedCondenser for a zero-cost trim. The result replaces the messages in
+// m.conv so the reduced context is used for all subsequent turns.
+func (m *model) compactConversation() tea.Cmd {
+	if m.conv == nil {
+		m.appendHistory("system", "[nothing to compact]", provider.TokenUsage{}, 0)
+		m.refreshViewport()
+		return nil
+	}
+
+	tokensBefore, _, _, _ := m.contextStats()
+	if tokensBefore == 0 {
+		tokensBefore = provider.EstimateTokens(m.conv.Messages(), "")
+	}
+
+	m.status = "compacting…"
+
+	ctx := m.ctx
+	msgs := m.conv.Messages()
+	conv := m.conv
+
+	// Resolve which condenser to use.
+	var c agent.Condenser
+	if m.cfg.SummaryProvider != nil && m.cfg.SummaryModel != "" {
+		c = &agent.LLMSummaryCondenser{
+			Provider: m.cfg.SummaryProvider,
+			Model:    m.cfg.SummaryModel,
+			KeepLast: 6,
+		}
+	} else {
+		c = &agent.AmortizedCondenser{MaxSize: 20, KeepFirst: 1}
+	}
+
+	return func() tea.Msg {
+		condensed, err := c.Condense(ctx, msgs, 0)
+		if err != nil {
+			return compactDoneMsg{err: err}
+		}
+		tokensAfter := provider.EstimateTokens(condensed, "")
+		conv.ReplaceMessages(condensed)
+		return compactDoneMsg{tokensBefore: tokensBefore, tokensAfter: tokensAfter}
+	}
+}
+
 // ── turn marks ────────────────────────────────────────────────────────────────
 
 // generateTurnSummary returns a tea.Cmd that generates a summary for the given
@@ -1911,6 +2010,7 @@ var slashCommands = []struct{ cmd, desc string }{
 	{"/question", "start a new question (resets context)"},
 	{"/pause", "suspend the agent and wait for guidance"},
 	{"/clear", "clear conversation history"},
+	{"/compact", "compress conversation history to save context"},
 	{"/help", "show keyboard shortcuts"},
 }
 
