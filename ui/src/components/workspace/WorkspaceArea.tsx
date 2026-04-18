@@ -19,7 +19,6 @@ import {
   type DragEndEvent,
   type DragStartEvent,
 } from '@dnd-kit/core'
-import { CSS } from '@dnd-kit/utilities'
 import { useShallow } from 'zustand/react/shallow'
 
 // Panel content components
@@ -434,7 +433,7 @@ function usePanelDrag(panelId: string) {
 // ─── Panel Content ─────────────────────────────────────────────────────────────
 
 function PanelContent({ node, agents, logLines }: { node: PanelNode; agents: AgentStatus[]; logLines: string[] }) {
-  const { removePanel, addPanel, movePanel, switchTab, closeTab, draggedDockItem, projects, activeProjectId, dockItems, openFile, dirtyFiles, flashPanelId, kindBehaviors } = useIDEStore()
+  const { removePanel, addPanel, switchTab, closeTab, draggedDockItem, projects, activeProjectId, dockItems, openFile, dirtyFiles, flashPanelId } = useIDEStore()
   const { dragRef, dragListeners, dragAttributes } = usePanelDrag(node.id)
   const draggingPanelId = useContext(DraggingPanelContext)
   const titleIndices = useContext(TitleIndicesContext)
@@ -837,7 +836,7 @@ export function WorkspaceArea({ agents, logLines }: WorkspaceAreaProps) {
   )
 }
 
-function EmptyWorkspaceDrop({ activeWorkspaceId, onDrop }: { activeWorkspaceId: string; onDrop: (id: string) => void }) {
+function EmptyWorkspaceDrop({ onDrop }: { activeWorkspaceId: string; onDrop: (id: string) => void }) {
   const { isOver, setNodeRef } = useDroppable({ id: 'empty-workspace' })
   const { draggedDockItem } = useIDEStore()
 

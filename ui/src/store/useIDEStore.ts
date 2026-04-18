@@ -655,7 +655,12 @@ export const useIDEStore = create<IDEState>()(
             } else {
               const tgtWs = newWorkspaces[targetWsIndex]
               if (!tgtWs.layout) return state
-              newWorkspaces[targetWsIndex] = { ...tgtWs, layout: mergeInto(tgtWs.layout) }
+              const crossTargetPanel = findPanel(tgtWs.layout, (_, n) => n.id === targetPanelId)
+              if (!crossTargetPanel) return state
+              const crossLayout = replaceNode(tgtWs.layout, targetPanelId, n =>
+                n.type === 'panel' ? doMerge(n, sourcePanel!) : n
+              )
+              newWorkspaces[targetWsIndex] = { ...tgtWs, layout: crossLayout }
               const srcWs = newWorkspaces[sourceWsIndex]
               newWorkspaces[sourceWsIndex] = {
                 ...srcWs,
