@@ -317,16 +317,15 @@ jobs:
 
   # -----------------------------------------------------------------------
   # Publish to winget (Windows)
-  # Disabled until co2-lab.Polvo is approved in microsoft/winget-pkgs.
-  # After the first manual PR is merged, re-enable this job.
-  # publish-winget:
-  #   name: Publish to winget
-  #   needs: build-tauri
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - name: Submit to winget
-  #       uses: vedantmgoyal9/winget-releaser@v2
-  #       with:
-  #         identifier: co2-lab.Polvo
-  #         token: ${{ secrets.WINGET_TOKEN }}
-  #         release-tag: ${{ github.ref_name }}
+  publish-winget:
+    name: Publish to winget
+    needs: build-tauri
+    runs-on: ubuntu-latest
+    steps:
+      - name: Submit to winget
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: co2lab.Polvo
+          token: ${{ secrets.WINGET_TOKEN }}
+          release-tag: ${{ github.ref_name }}
+

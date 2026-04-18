@@ -18,11 +18,11 @@ const (
 
 // Restorer performs checkpoint restore operations.
 type Restorer struct {
-	store *FSStore
+	store Saver
 }
 
 // NewRestorer creates a Restorer backed by the given store.
-func NewRestorer(store *FSStore) *Restorer {
+func NewRestorer(store Saver) *Restorer {
 	return &Restorer{store: store}
 }
 

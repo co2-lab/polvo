@@ -23,6 +23,7 @@ export interface StatusResponse {
   watching: boolean
   agent_running: boolean
   dashboard_url: string
+  telemetry_disabled?: boolean
 }
 
 export interface SnapshotPayload {

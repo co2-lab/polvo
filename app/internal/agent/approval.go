@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/co2-lab/polvo/internal/policy"
+	"github.com/co2-lab/polvo/internal/risk"
 )
 
 // ApprovalRequest is sent to the PermissionCallback before executing a tool
@@ -23,8 +26,11 @@ type ApprovalRequest struct {
 type ApprovalDecision int
 
 const (
-	ApprovalAllow ApprovalDecision = iota
+	ApprovalAllow          ApprovalDecision = iota
 	ApprovalDeny
+	ApprovalAllowSession   // allow now + create session-scoped policy (no disk write)
+	ApprovalAllowPermanent // allow now + create permanent policy (written to disk)
+	ApprovalDenySession    // deny now + create session-scoped deny policy
 )
 
 // PermissionCallback is called before executing any tool that has "ask" permission.
@@ -129,7 +135,13 @@ func previewAndRisk(toolName string, input json.RawMessage) (preview, risk strin
 		if path == "" {
 			return "write file", risk
 		}
-		return "write " + path, risk
+		content := str("content")
+		if content != "" {
+			preview = diffPreview(path, "", content, 8)
+		} else {
+			preview = "write " + path
+		}
+		return preview, risk
 
 	case "edit":
 		path := str("path")
@@ -137,7 +149,14 @@ func previewAndRisk(toolName string, input json.RawMessage) (preview, risk strin
 		if path == "" {
 			return "edit file", risk
 		}
-		return "edit " + path, risk
+		oldStr := str("old_string")
+		newStr := str("new_string")
+		if oldStr != "" || newStr != "" {
+			preview = diffPreview(path, oldStr, newStr, 8)
+		} else {
+			preview = "edit " + path
+		}
+		return preview, risk
 
 	case "patch":
 		path := str("path")
@@ -223,6 +242,72 @@ func classifyBashRisk(cmd string) string {
 	return "medium"
 }
 
+// PolicyChannelCallback wraps ChannelCallback with a PolicyStore short-circuit.
+// Before delegating to the inner channel, it checks for a matching policy and
+// short-circuits if one is found. Decisions carrying session/permanent scope
+// are converted into policies and stored for future calls.
+type PolicyChannelCallback struct {
+	Inner    *ChannelCallback
+	Policies *policy.PolicyStore
+	Scorer   risk.RiskScorer
+}
+
+func (c *PolicyChannelCallback) RequestApproval(ctx context.Context, req ApprovalRequest) (ApprovalDecision, error) {
+	// Authoritative risk scoring — overwrite whatever the LLM supplied.
+	scorer := c.Scorer
+	if scorer == nil {
+		scorer = risk.NoopScorer{}
+	}
+	computedRisk := scorer.Score(req.ToolName, req.ToolInput)
+	req.RiskLevel = computedRisk.String()
+
+	// Policy short-circuit: if a matching policy exists, return immediately.
+	if c.Policies != nil {
+		if decision, ok := c.Policies.Evaluate(req.AgentName, req.ToolName, computedRisk); ok {
+			if decision == policy.PolicyAllow {
+				return ApprovalAllow, nil
+			}
+			return ApprovalDeny, nil
+		}
+	}
+
+	// Delegate to the inner channel.
+	extended, err := c.Inner.RequestApproval(ctx, req)
+	if err != nil {
+		return ApprovalDeny, err
+	}
+
+	// Translate extended decisions into policies and canonicalize.
+	if c.Policies != nil {
+		switch extended {
+		case ApprovalAllowSession:
+			_ = c.Policies.Upsert(policy.Policy{
+				Scope:    policy.PolicyScope{AgentName: req.AgentName, ToolName: req.ToolName},
+				Decision: policy.PolicyAllow,
+				TTL:      policy.TTLSession,
+			})
+			return ApprovalAllow, nil
+		case ApprovalAllowPermanent:
+			_ = c.Policies.Upsert(policy.Policy{
+				Scope:    policy.PolicyScope{AgentName: req.AgentName, ToolName: req.ToolName},
+				Decision: policy.PolicyAllow,
+				TTL:      policy.TTLPermanent,
+			})
+			return ApprovalAllow, nil
+		case ApprovalDenySession:
+			_ = c.Policies.Upsert(policy.Policy{
+				Scope:    policy.PolicyScope{AgentName: req.AgentName, ToolName: req.ToolName},
+				Decision: policy.PolicyDeny,
+				TTL:      policy.TTLSession,
+			})
+			return ApprovalDeny, nil
+		}
+	}
+
+	// Pass through Allow/Deny unchanged.
+	return extended, nil
+}
+
 // DefaultApprovalCallback returns an appropriate PermissionCallback for the given autonomy mode.
 // For AutonomySupervised, callers must supply a ChannelCallback themselves; nil is returned
 // as a sentinel — the caller should replace it before use.
@@ -235,4 +320,54 @@ func DefaultApprovalCallback(autonomy AutonomyMode) PermissionCallback {
 	default: // AutonomySupervised
 		return nil // caller must provide ChannelCallback
 	}
+}
+
+// diffPreview generates a compact unified-diff-style preview for approval UI.
+// For write operations, oldStr should be empty and newStr is the new content.
+// For edit operations, oldStr/newStr are the before/after strings.
+// maxLines limits the number of lines shown (0 = no limit).
+func diffPreview(path, oldStr, newStr string, maxLines int) string {
+	var sb strings.Builder
+	sb.WriteString("--- " + path + "\n")
+	sb.WriteString("+++ " + path + "\n")
+
+	// Show removed lines
+	if oldStr != "" {
+		for i, line := range splitLines(oldStr) {
+			if maxLines > 0 && i >= maxLines/2 {
+				sb.WriteString("- …\n")
+				break
+			}
+			sb.WriteString("- " + line + "\n")
+		}
+	}
+
+	// Show added lines
+	if newStr != "" {
+		newLines := splitLines(newStr)
+		limit := len(newLines)
+		truncated := false
+		if maxLines > 0 && limit > maxLines {
+			limit = maxLines
+			truncated = true
+		}
+		for _, line := range newLines[:limit] {
+			sb.WriteString("+ " + line + "\n")
+		}
+		if truncated {
+			sb.WriteString("+ …\n")
+		}
+	}
+
+	return sb.String()
+}
+
+// splitLines splits s into lines without trailing newlines.
+func splitLines(s string) []string {
+	lines := strings.Split(s, "\n")
+	// Trim trailing empty line from final newline.
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
 }

@@ -2,8 +2,13 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -14,48 +19,155 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/co2-lab/polvo/internal/agent"
+	"github.com/co2-lab/polvo/internal/agent/checkpoint"
+	"github.com/co2-lab/polvo/internal/agent/microagent"
 	"github.com/co2-lab/polvo/internal/provider"
+	"github.com/co2-lab/polvo/internal/session"
+	"github.com/co2-lab/polvo/internal/skill"
 	"github.com/co2-lab/polvo/internal/tool"
 )
 
+// FileIndexer handles incremental file indexing for the chunk search index.
+type FileIndexer interface {
+	IndexFile(path string) error
+	RemoveFile(path string) error
+}
+
 // Config configures the TUI session.
 type Config struct {
-	WorkDir  string
+	WorkDir         string
+	Provider        provider.ChatProvider
+	Model           string
+	ToolReg         *tool.Registry
+	System          string
+	MaxTurns        int
+	ProviderOptions []ProviderOption // optional: enables /model picker
+	// AddProviderFn is called when the user selects "Add new provider…" in the
+	// /model picker. It should run a setup wizard and return an updated list of
+	// ProviderOptions. If nil, the "Add" entry is not shown.
+	AddProviderFn func() ([]ProviderOption, error)
+	// Indexer is optional. When set, file change events update the chunk index.
+	Indexer FileIndexer
+	// SessionManager is optional. When set, /task and /question commands are enabled.
+	SessionManager *session.Manager
+	// SummaryRunner is optional. When set, async summaries are generated for work items.
+	SummaryRunner *session.SummaryRunner
+	// SummaryModel is optional. When set, a dedicated cheap model is used for turn
+	// summaries and session work item summaries. When empty, InlineSummary mode is used.
+	SummaryModel string
+	// SummaryProvider is the provider to use for dedicated summary calls.
+	// Only used when SummaryModel is non-empty.
+	SummaryProvider provider.ChatProvider
+	// SkillExtractor is optional. When set, skills are extracted at the end
+	// of each work item and stored in the memory store for future sessions.
+	SkillExtractor *skill.Extractor
+	// ContextWindow is the model context window size in tokens.
+	// When 0, the value from the known model table is used as a default.
+	ContextWindow int
+}
+
+// ProviderOption is a selectable provider+model pair for the /model picker.
+type ProviderOption struct {
+	Label    string               // display name, e.g. "claude · claude-sonnet-4-5"
 	Provider provider.ChatProvider
 	Model    string
-	ToolReg  *tool.Registry
-	System   string
-	MaxTurns int
 }
 
 // Run starts the bubbletea TUI and blocks until the user exits.
 func Run(ctx context.Context, cfg Config) error {
 	m := newModel(ctx, cfg)
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithInput(os.Stdin))
 	m.perm.prog = p
 	final, err := p.Run()
 	if err != nil {
 		return err
 	}
-	if fm, ok := final.(model); ok && fm.history != "" {
-		fmt.Println(fm.history)
+	if fm, ok := final.(model); ok {
+		printExitSummary(fm)
 	}
 	return nil
+}
+
+func printExitSummary(m model) {
+	var parts []string
+	if m.turn > 0 {
+		parts = append(parts, fmt.Sprintf("%d turns", m.turn))
+	}
+	if m.liveTokens > 0 {
+		parts = append(parts, fmtTokens(m.liveTokens))
+	}
+	if m.liveCost > 0 {
+		parts = append(parts, fmtCost(m.liveCost))
+	}
+	if !m.startedAt.IsZero() {
+		parts = append(parts, fmtDuration(time.Since(m.startedAt)))
+	}
+
+	goodbye := "\033[2m✦ goodbye"
+	if len(parts) > 0 {
+		goodbye += "  " + strings.Join(parts, " · ")
+	}
+	goodbye += "\033[0m"
+	fmt.Println(goodbye)
 }
 
 // ── tea messages ─────────────────────────────────────────────────────────────
 
 type agentDeltaMsg struct{ delta string }
 type agentDoneMsg struct {
-	finalText string
-	err       error
+	finalText  string
+	err        error
+	tokensUsed provider.TokenUsage
+	costUSD    float64
 }
 type toolCallMsg struct {
 	name, preview string
+	output        string
+	dur           time.Duration
 	done, isError bool
 }
 type approvalRequestMsg struct{ req agent.ApprovalRequest }
 type approvalSessionMsg struct{ toolName string } // allow this tool for the rest of the session
+type agentSuspendedMsg struct{ signal agent.SuspendSignal }
+type providerRetryMsg struct {
+	attempt     int
+	maxAttempts int
+	delay       time.Duration
+	deadline    time.Time
+	errText     string // original error message
+}
+type retryTickMsg struct{ id int }
+type turnSummaryDoneMsg struct {
+	turnIdx       int
+	summary       string
+	err           error
+	userRequested bool // true = user explicitly dismissed; false = inline auto-summary
+}
+type addProviderDoneMsg struct {
+	opts []ProviderOption
+	err  error
+}
+
+// addProviderExec implements tea.ExecCommand so the TUI hands the terminal to
+// AddProviderFn (the setup wizard) and then resumes.
+type addProviderExec struct {
+	fn     func() ([]ProviderOption, error)
+	result *addProviderDoneMsg
+
+	stdin  io.Reader
+	stdout io.Writer
+	stderr io.Writer
+}
+
+func (e *addProviderExec) Run() error {
+	opts, err := e.fn()
+	e.result.opts = opts
+	e.result.err = err
+	return nil // errors are surfaced via addProviderDoneMsg.err
+}
+func (e *addProviderExec) SetStdin(r io.Reader)  { e.stdin = r }
+func (e *addProviderExec) SetStdout(w io.Writer) { e.stdout = w }
+func (e *addProviderExec) SetStderr(w io.Writer) { e.stderr = w }
 
 // ── styles ────────────────────────────────────────────────────────────────────
 
@@ -70,22 +182,26 @@ var (
 	styleError     = lipgloss.NewStyle().Foreground(lipgloss.Color("204")).Bold(true) // Pastel red
 	styleSystem    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 
-	// message blocks (left border)
+	// message blocks: vibrant left border, margin top/bottom for spacing between blocks
 	styleUserBlock      = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), false, false, false, true).BorderForeground(lipgloss.Color("147")).PaddingLeft(1).MarginBottom(1)
 	styleAssistantBlock = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), false, false, false, true).BorderForeground(lipgloss.Color("43")).PaddingLeft(1).MarginBottom(1)
 	styleErrorBlock     = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), false, false, false, true).BorderForeground(lipgloss.Color("204")).PaddingLeft(1).MarginBottom(1)
 	styleToolBlock      = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), false, false, false, true).BorderForeground(lipgloss.Color("239")).PaddingLeft(1).MarginBottom(1)
 
 	// ui chrome
-	styleDim       = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	styleMuted     = lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
-	styleApproval  = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
-	styleSuccess   = lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
-	styleWarning   = lipgloss.NewStyle().Foreground(lipgloss.Color("221"))
-	
+	styleDim      = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	styleMuted    = lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
+	styleApproval = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
+	styleSuccess  = lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
+	styleWarning  = lipgloss.NewStyle().Foreground(lipgloss.Color("221"))
+
+	// turn marks
+	styleUsefulBlock    = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), false, false, false, true).BorderForeground(lipgloss.Color("220")).PaddingLeft(1).MarginBottom(1)
+	styleSelectedBlock  = lipgloss.NewStyle().Border(lipgloss.ThickBorder(), false, false, false, true).BorderForeground(lipgloss.Color("220")).PaddingLeft(1).MarginBottom(1)
+	styleDismissedBlock = lipgloss.NewStyle().Border(lipgloss.NormalBorder(), false, false, false, true).BorderForeground(lipgloss.Color("238")).PaddingLeft(1).MarginBottom(1)
+
 	// solid backgrounds for header/footer
-	styleStatusBg  = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("250")).Padding(0, 1)
-	styleHeaderBg  = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("250")).Padding(0, 1).Bold(true)
+	styleStatusBg = lipgloss.NewStyle().Background(lipgloss.Color("236")).Foreground(lipgloss.Color("250")).Padding(0, 1)
 
 	// tool icons by name
 	toolIcons = map[string]string{
@@ -98,6 +214,9 @@ var (
 		"ls":         "📂",
 		"web_fetch":  "🌐",
 		"web_search": "🔎",
+		"think":      "💭",
+		"diff":       "±",
+		"patch":      "🔩",
 	}
 )
 
@@ -132,10 +251,26 @@ func (t *tuiPermission) RequestApproval(ctx context.Context, req agent.ApprovalR
 
 type toolEntry struct {
 	name    string
-	preview string
+	preview string        // formatted input (human-readable)
+	output  string        // first meaningful line of tool output
 	done    bool
 	isError bool
 	start   time.Time
+	dur     time.Duration // set when done=true
+}
+
+// historyEntry is a single rendered entry in the conversation history.
+// Entries with turnIdx >= 0 belong to a completed turn and can be marked.
+type historyEntry struct {
+	role    string // "user", "assistant", "error", "system", "tools"
+	text    string // raw text content (unstyled)
+	turnIdx int    // -1 for non-turn entries (error, system, tools)
+	// token/cost metadata (only set for "assistant" role)
+	tokens provider.TokenUsage
+	cost   float64
+	// calls holds the raw tool entries for "tools" role entries,
+	// so they can be re-rendered when showTools is toggled.
+	calls  []toolEntry
 }
 
 type model struct {
@@ -151,7 +286,8 @@ type model struct {
 	agentRunning bool
 	cancelRun    context.CancelFunc
 	turn         int
-	history      string
+	history      string          // cached rendered output, rebuilt by refreshViewport
+	historyEntries []historyEntry // structured entries backing history
 
 	toolCalls []toolEntry
 
@@ -160,10 +296,53 @@ type model struct {
 	approvalResCh    chan agent.ApprovalDecision
 	perm             *tuiPermission
 
-	currentDelta  strings.Builder
+	currentDelta  string
 	status        string
+	retryDeadline        time.Time // non-zero while waiting for a provider retry
+	retryAttempt         int
+	retryMaxAttempts     int
+	retryErrText         string // original error message from the first retry trigger
+	retryCancelledByUser bool
+	retryTickID          int // incremented on each new retry to invalidate stale ticks
 	startedAt     time.Time
+	// live token accumulation (updated per turn via agentDoneMsg)
+	liveTokens       int
+	liveCost         float64
+	lastPromptTokens int // PromptTokens from the last API response (real context size)
+
 	confirmingExit bool
+
+	// /model picker state
+	pickingModel  bool
+	pickerCursor  int
+	addingProvider bool // true while AddProviderFn is running
+
+	// autocomplete state
+	acItems  []string // current completion candidates
+	acCursor int      // selected index
+	acActive bool     // dropdown visible
+
+	// tool detail visibility (Ctrl+T toggle)
+	showTools bool
+
+	// active work item (set by /task or /question commands)
+	activeWorkItemID    string
+	lastWorkItemSummary string
+
+	// suspend/resume state
+	suspended      bool
+	suspendCh      chan agent.SuspendSignal
+	resumeCh       chan string
+	pendingSuspend agent.SuspendSignal
+
+	// turn mark state
+	turnSelectMode  bool
+	selectedTurn    int // -1 = none
+	turnMarks       map[int]agent.TurnMetadata // marks indexed by TUI turn index (persists across agent runs)
+	convTurnOffset  int // m.turn value at the start of the current agent run
+	conv           *agent.Conversation
+	ckptStore      checkpoint.Saver
+	ckptSessionID  string
 }
 
 func newModel(ctx context.Context, cfg Config) model {
@@ -179,7 +358,7 @@ func newModel(ctx context.Context, cfg Config) model {
 	ta.FocusedStyle.Text = lipgloss.NewStyle()
 	ta.FocusedStyle.Prompt = lipgloss.NewStyle()
 	ta.FocusedStyle.Placeholder = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	
+
 	// Ensure cursor is visible
 	ta.Cursor.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
 	ta.Cursor.Blink = true
@@ -203,6 +382,8 @@ func newModel(ctx context.Context, cfg Config) model {
 		perm:          perm,
 		approvalResCh: resCh,
 		status:        "ready",
+		showTools:     true,
+		selectedTurn:  -1,
 	}
 }
 
@@ -230,6 +411,146 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Any key cancels the exit-confirmation state (unless it's the confirm key itself).
 		if m.confirmingExit && msg.Type != tea.KeyCtrlC && msg.Type != tea.KeyCtrlD {
 			m.confirmingExit = false
+		}
+
+		// /model picker navigation
+		if m.pickingModel {
+			opts := m.cfg.ProviderOptions
+			hasAdd := m.cfg.AddProviderFn != nil
+			total := len(opts)
+			if hasAdd {
+				total++ // extra "Add new provider…" row
+			}
+			switch msg.Type {
+			case tea.KeyEsc, tea.KeyCtrlC:
+				m.pickingModel = false
+				return m, nil
+			case tea.KeyUp:
+				if m.pickerCursor > 0 {
+					m.pickerCursor--
+				}
+				return m, nil
+			case tea.KeyDown:
+				if m.pickerCursor < total-1 {
+					m.pickerCursor++
+				}
+				return m, nil
+			case tea.KeyEnter:
+				if hasAdd && m.pickerCursor == len(opts) {
+					// "Add new provider…" selected — hand terminal to wizard.
+					m.pickingModel = false
+					m.addingProvider = true
+					fn := m.cfg.AddProviderFn
+					var result addProviderDoneMsg
+					return m, tea.Exec(&addProviderExec{fn: fn, result: &result}, func(err error) tea.Msg {
+						if err != nil {
+							result.err = err
+						}
+						return result
+					})
+				}
+				if m.pickerCursor < len(opts) {
+					sel := opts[m.pickerCursor]
+					m.cfg.Provider = sel.Provider
+					m.cfg.Model = sel.Model
+				}
+				m.pickingModel = false
+				return m, nil
+			case tea.KeyRunes:
+				switch string(msg.Runes) {
+				case "k":
+					if m.pickerCursor > 0 {
+						m.pickerCursor--
+					}
+				case "j":
+					if m.pickerCursor < total-1 {
+						m.pickerCursor++
+					}
+				}
+				return m, nil
+			}
+			return m, nil
+		}
+
+		// Turn selection mode navigation.
+		if m.turnSelectMode {
+			totalTurns := m.turn
+			switch msg.Type {
+			case tea.KeyEsc:
+				m.turnSelectMode = false
+				m.selectedTurn = -1
+				m.rebuildHistory()
+				m.refreshViewport()
+				return m, nil
+			case tea.KeyUp:
+				if m.selectedTurn > 0 {
+					m.selectedTurn--
+					m.rebuildHistory()
+					m.refreshViewport()
+				}
+				return m, nil
+			case tea.KeyDown:
+				if m.selectedTurn < totalTurns-1 {
+					m.selectedTurn++
+					m.rebuildHistory()
+					m.refreshViewport()
+				}
+				return m, nil
+			case tea.KeyRunes:
+				switch string(msg.Runes) {
+				case "k":
+					if m.selectedTurn > 0 {
+						m.selectedTurn--
+						m.rebuildHistory()
+						m.refreshViewport()
+					}
+					return m, nil
+				case "j":
+					if m.selectedTurn < totalTurns-1 {
+						m.selectedTurn++
+						m.rebuildHistory()
+						m.refreshViewport()
+					}
+					return m, nil
+				case "d":
+					// Toggle dismiss: remove mark if already dismissed, otherwise set it.
+					// Stay in turn select mode so the user can mark multiple turns.
+					if m.selectedTurn >= 0 {
+						turnIdx := m.selectedTurn
+						if m.getTurnMark(turnIdx).Mark == agent.TurnMarkDismissed {
+							m.setTurnMark(turnIdx, agent.TurnMarkNone, "")
+							m.rebuildHistory()
+							m.refreshViewport()
+						} else {
+							m.setTurnMark(turnIdx, agent.TurnMarkDismissed, "")
+							m.rebuildHistory()
+							m.refreshViewport()
+							return m, m.generateTurnSummary(m.ctx, turnIdx)
+						}
+					}
+					return m, nil
+				case "u":
+					// Toggle useful mark. Stay in turn select mode.
+					if m.selectedTurn >= 0 {
+						if m.getTurnMark(m.selectedTurn).Mark == agent.TurnMarkUseful {
+							m.setTurnMark(m.selectedTurn, agent.TurnMarkNone, "")
+						} else {
+							m.setTurnMark(m.selectedTurn, agent.TurnMarkUseful, "")
+						}
+						m.persistTurnMarks()
+						m.rebuildHistory()
+						m.refreshViewport()
+					}
+					return m, nil
+				case "c":
+					m.turnSelectMode = false
+					m.selectedTurn = -1
+					m.rebuildHistory()
+					m.refreshViewport()
+					return m, nil
+				}
+			}
+			return m, nil
 		}
 
 		switch msg.Type {
@@ -262,6 +583,72 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "running…"
 				return m, nil
 			}
+			if m.suspended {
+				input := strings.TrimSpace(m.textarea.Value())
+				if input != "" {
+					m.textarea.Reset()
+					m.textarea.Placeholder = "Ask anything… (Enter ↵ send  Ctrl+D exit)"
+					m.suspended = false
+					m.agentRunning = true
+					m.status = "resuming…"
+					m.resumeCh <- input
+				}
+				return m, nil
+			}
+			if !m.agentRunning {
+				prompt := strings.TrimSpace(m.textarea.Value())
+				if prompt != "" {
+					m.textarea.Reset()
+					// intercept /model command
+					if prompt == "/model" {
+						if len(m.cfg.ProviderOptions) > 0 {
+							// pre-select current
+							for i, o := range m.cfg.ProviderOptions {
+								if o.Provider.Name() == m.cfg.Provider.Name() && o.Model == m.cfg.Model {
+									m.pickerCursor = i
+									break
+								}
+							}
+							m.pickingModel = true
+						}
+						return m, nil
+					}
+					// intercept /pause command when agent is running
+					if prompt == "/pause" && m.agentRunning && m.cancelRun != nil {
+						m.cancelRun()
+						return m, nil
+					}
+					// intercept /task and /question commands
+					if m.cfg.SessionManager != nil {
+						if strings.HasPrefix(prompt, "/task ") || strings.HasPrefix(prompt, "/question ") {
+							return m, m.startWorkItem(prompt)
+						}
+					}
+					return m, m.startAgent(prompt)
+				}
+			}
+
+		case tea.KeyCtrlT:
+			m.showTools = !m.showTools
+			m.rebuildHistory()
+			m.refreshViewport()
+			return m, nil
+
+		case tea.KeyCtrlX:
+			// Enter/exit turn selection mode (when there are completed turns).
+			if !m.agentRunning && m.turn > 0 {
+				if m.turnSelectMode {
+					m.turnSelectMode = false
+					m.selectedTurn = -1
+					m.rebuildHistory()
+				} else {
+					m.turnSelectMode = true
+					m.selectedTurn = m.turn - 1 // start at most recent turn
+					m.rebuildHistory()
+				}
+				m.refreshViewport()
+				return m, nil
+			}
 
 		case tea.KeyRunes:
 			if m.awaitingApproval && string(msg.Runes) == "a" {
@@ -273,20 +660,67 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "running…"
 				return m, tea.Cmd(func() tea.Msg { return approvalSessionMsg{toolName: toolName} })
 			}
-			if !m.agentRunning {
-				prompt := strings.TrimSpace(m.textarea.Value())
-				if prompt == "" {
-					return m, nil
-				}
-				m.textarea.Reset()
-				return m, m.startAgent(prompt)
-			}
 
 		case tea.KeyEsc:
+			if m.acActive {
+				m.acActive = false
+				m.acItems = nil
+				return m, nil
+			}
 			if m.awaitingApproval {
 				m.awaitingApproval = false
 				m.approvalResCh <- agent.ApprovalDeny
 				m.status = "ready"
+				return m, nil
+			}
+			if !m.retryDeadline.IsZero() && m.cancelRun != nil {
+				m.cancelRun()
+				m.cancelRun = nil
+				errMsg := retryErrorMsg(m.retryErrText, m.retryAttempt, m.retryMaxAttempts, true)
+				m.retryDeadline = time.Time{}
+				m.retryTickID++ // discard pending ticks
+				m.agentRunning = false
+				m.retryCancelledByUser = false
+				m.retryAttempt = 0
+				m.retryErrText = ""
+				m.status = "ready"
+				m.appendHistory("error", errMsg, provider.TokenUsage{}, 0)
+				m.refreshViewport()
+				m.viewport.GotoBottom()
+				return m, textarea.Blink
+			}
+
+		case tea.KeyTab:
+			if !m.awaitingApproval && !m.agentRunning {
+				if m.acActive && len(m.acItems) > 0 {
+					m.acApply(m.acItems[m.acCursor])
+					m.acActive = false
+					m.acItems = nil
+					return m, nil
+				}
+				// trigger autocomplete
+				items := m.acComputeItems(m.textarea.Value())
+				if len(items) > 0 {
+					m.acItems = items
+					m.acCursor = 0
+					m.acActive = true
+					return m, nil
+				}
+			}
+
+		case tea.KeyUp:
+			if m.acActive {
+				if m.acCursor > 0 {
+					m.acCursor--
+				}
+				return m, nil
+			}
+
+		case tea.KeyDown:
+			if m.acActive {
+				if m.acCursor < len(m.acItems)-1 {
+					m.acCursor++
+				}
 				return m, nil
 			}
 		}
@@ -295,6 +729,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var taCmd tea.Cmd
 			m.textarea, taCmd = m.textarea.Update(msg)
 			cmds = append(cmds, taCmd)
+			// update autocomplete after every keystroke
+			if !m.acActive {
+				items := m.acComputeItems(m.textarea.Value())
+				if len(items) > 0 {
+					m.acItems = items
+					m.acCursor = 0
+					m.acActive = true
+				}
+			} else {
+				// recompute and close if no matches
+				items := m.acComputeItems(m.textarea.Value())
+				if len(items) == 0 {
+					m.acActive = false
+					m.acItems = nil
+				} else {
+					m.acItems = items
+					if m.acCursor >= len(items) {
+						m.acCursor = 0
+					}
+				}
+			}
 		}
 
 	case spinner.TickMsg:
@@ -303,7 +758,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, spCmd)
 
 	case agentDeltaMsg:
-		m.currentDelta.WriteString(msg.delta)
+		m.currentDelta += msg.delta
 		m.refreshViewport()
 		m.viewport.GotoBottom()
 		cmds = append(cmds, drainChan(msg))
@@ -314,6 +769,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.toolCalls[i].name == msg.name && !m.toolCalls[i].done {
 					m.toolCalls[i].done = true
 					m.toolCalls[i].isError = msg.isError
+					m.toolCalls[i].output = msg.output
+					m.toolCalls[i].dur = msg.dur
 					break
 				}
 			}
@@ -328,6 +785,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshViewport()
 
+	case providerRetryMsg:
+		m.retryDeadline = msg.deadline
+		m.retryAttempt = msg.attempt
+		m.retryMaxAttempts = msg.maxAttempts
+		if m.retryErrText == "" {
+			m.retryErrText = msg.errText
+		}
+		m.retryTickID++ // invalidate any previously scheduled ticks
+		tickID := m.retryTickID
+		secs := int(time.Until(m.retryDeadline).Seconds()) + 1
+		m.status = fmt.Sprintf("rate limit — retrying in %ds (attempt %d/%d)…", secs, m.retryAttempt, m.retryMaxAttempts)
+		m.refreshViewport()
+		cmds = append(cmds, tea.Tick(time.Second, func(time.Time) tea.Msg { return retryTickMsg{id: tickID} }))
+
+	case retryTickMsg:
+		if m.retryDeadline.IsZero() || msg.id != m.retryTickID {
+			break // stale tick from a previous retry cycle — discard
+		}
+		remaining := time.Until(m.retryDeadline)
+		if remaining <= 0 {
+			m.retryDeadline = time.Time{}
+			m.status = "retrying…"
+		} else {
+			secs := int(remaining.Seconds()) + 1
+			m.status = fmt.Sprintf("rate limit — retrying in %ds (attempt %d/%d)…", secs, m.retryAttempt, m.retryMaxAttempts)
+			tickID := m.retryTickID
+			cmds = append(cmds, tea.Tick(time.Second, func(time.Time) tea.Msg { return retryTickMsg{id: tickID} }))
+		}
+		m.refreshViewport()
+
 	case approvalRequestMsg:
 		m.awaitingApproval = true
 		m.pendingReq = msg.req
@@ -337,19 +824,111 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case approvalSessionMsg:
 		// no-op: already handled inline; just triggers a re-render
 
+	case addProviderDoneMsg:
+		m.addingProvider = false
+		if msg.err != nil {
+			m.appendHistory("error", "add provider: "+msg.err.Error(), provider.TokenUsage{}, 0)
+		} else if len(msg.opts) > 0 {
+			m.cfg.ProviderOptions = msg.opts
+			// Reopen the picker so the user can choose among all providers.
+			m.pickerCursor = len(msg.opts) - 1 // pre-select the newly added one
+			m.pickingModel = true
+		}
+		m.refreshViewport()
+
+	case turnSummaryDoneMsg:
+		if msg.err == nil && msg.summary != "" {
+			if msg.userRequested {
+				// User explicitly dismissed this turn — mark it collapsed.
+				m.setTurnMark(msg.turnIdx, agent.TurnMarkDismissed, msg.summary)
+				m.persistTurnMarks()
+			} else {
+				// Inline auto-summary: store the text for context-compression only,
+				// do NOT visually collapse the turn.
+				if m.turnMarks == nil {
+					m.turnMarks = make(map[int]agent.TurnMetadata)
+				}
+				existing := m.getTurnMark(msg.turnIdx)
+				existing.Summary = msg.summary
+				m.turnMarks[msg.turnIdx] = existing
+			}
+			m.lastWorkItemSummary = msg.summary
+		} else if msg.err != nil && msg.userRequested {
+			// Summary failed for user-requested dismiss — clear mark so content shows.
+			m.setTurnMark(msg.turnIdx, agent.TurnMarkNone, "")
+		}
+		m.rebuildHistory()
+		m.refreshViewport()
+
+	case agentSuspendedMsg:
+		m.suspended = true
+		m.agentRunning = false
+		m.pendingSuspend = msg.signal
+		m.status = "waiting for guidance…"
+		banner := "⏸  agent suspended: " + msg.signal.Preview
+		m.appendHistory("system", banner, provider.TokenUsage{}, 0)
+		m.textarea.Placeholder = "Type guidance to resume the agent…"
+		m.refreshViewport()
+		m.viewport.GotoBottom()
+		return m, textarea.Blink
+
 	case agentDoneMsg:
 		m.agentRunning = false
+		m.retryDeadline = time.Time{}
 		m.cancelRun = nil
-		if m.currentDelta.Len() > 0 {
-			m.appendHistory("assistant", m.currentDelta.String())
-			m.currentDelta.Reset()
+		cancelledByUser := m.retryCancelledByUser
+		hadRetries := m.retryAttempt > 0 && m.retryErrText != ""
+		retryErrText := m.retryErrText
+		retryAttempt := m.retryAttempt
+		retryMaxAttempts := m.retryMaxAttempts
+		m.retryCancelledByUser = false
+		m.retryAttempt = 0
+		m.retryErrText = ""
+		m.liveTokens += msg.tokensUsed.TotalTokens
+		if msg.tokensUsed.PromptTokens > 0 {
+			m.lastPromptTokens = msg.tokensUsed.PromptTokens
 		}
+		m.liveCost += msg.costUSD
 		if len(m.toolCalls) > 0 {
 			m.appendToolSummary()
 			m.toolCalls = nil
 		}
-		if msg.err != nil {
-			m.appendHistory("error", friendlyError(msg.err.Error()))
+		if m.currentDelta != "" {
+			m.appendHistory("assistant", m.currentDelta, msg.tokensUsed, msg.costUSD)
+			m.currentDelta = ""
+		}
+		if msg.err != nil && !cancelledByUser {
+			var errMsg string
+			if hadRetries {
+				errMsg = retryErrorMsg(retryErrText, retryAttempt, retryMaxAttempts, false)
+			} else {
+				errMsg = friendlyError(msg.err.Error())
+			}
+			m.appendHistory("error", errMsg, provider.TokenUsage{}, 0)
+		}
+		// Finish active work item (non-blocking).
+		if m.activeWorkItemID != "" && m.cfg.SessionManager != nil {
+			id := m.activeWorkItemID
+			go func() { _ = m.cfg.SessionManager.Finish(m.ctx, id) }()
+			// Extract skills learned during this work item.
+			if m.cfg.SkillExtractor != nil {
+				history := m.buildTurnHistoryText()
+				summary := m.lastWorkItemSummary
+				workDir := m.cfg.WorkDir
+				extractor := m.cfg.SkillExtractor
+				go func() {
+					ctx2, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					n, err := extractor.Extract(ctx2, history, summary, workDir)
+					if err != nil {
+						slog.Warn("skill extraction failed", "err", err)
+					} else if n > 0 {
+						slog.Info("skills extracted", "count", n)
+					}
+				}()
+			}
+			m.activeWorkItemID = ""
+			m.lastWorkItemSummary = ""
 		}
 		m.refreshViewport()
 		m.viewport.GotoBottom()
@@ -407,7 +986,11 @@ func (m model) renderHeader() string {
 	dir := compactPath(m.cfg.WorkDir)
 	model := m.cfg.Model
 
-	left := styleHeaderBg.Render(wordmark) + "  " + styleMuted.Render(dir) + styleDim.Render(" • ") + styleMuted.Render(model)
+	toolsIndicator := ""
+	if !m.showTools {
+		toolsIndicator = styleDim.Render("  [tools hidden]")
+	}
+	left := wordmark + "  " + styleMuted.Render(dir) + styleDim.Render(" • ") + styleMuted.Render(model) + toolsIndicator
 
 	right := ""
 	if m.agentRunning && m.cfg.MaxTurns > 0 {
@@ -445,18 +1028,28 @@ func (m model) renderStatusBar() string {
 
 	case m.agentRunning:
 		sp := m.spinner.View()
-		stat := styleMuted.Render(" " + truncate(m.status, maxW-30))
-		elapsed := ""
+		statPlain := " " + truncate(m.status, maxW-40)
+
+		// right side: elapsed + live tokens
+		var rightParts []string
 		if !m.startedAt.IsZero() {
-			elapsed = styleDim.Render(fmt.Sprintf(" %s ", fmtDuration(time.Since(m.startedAt))))
+			rightParts = append(rightParts, fmtDuration(time.Since(m.startedAt)))
 		}
-		
-		left := styleStatusBg.Render(sp+" Running") + stat
-		leftLen := lipgloss.Width(left)
-		elapsedLen := lipgloss.Width(elapsed)
-		pad := m.width - leftLen - elapsedLen
-		if pad < 0 { pad = 0 }
-		return left + strings.Repeat(" ", pad) + elapsed
+		if m.liveTokens > 0 {
+			rightParts = append(rightParts, fmtTokens(m.liveTokens))
+		}
+		rightPlain := ""
+		if len(rightParts) > 0 {
+			rightPlain = " " + strings.Join(rightParts, " · ") + " "
+		}
+
+		left := styleStatusBg.Render(sp) + styleStatusBg.Render("Running") + styleMuted.Render(statPlain)
+		right := styleDim.Render(rightPlain)
+		pad := m.width - lipgloss.Width(left) - lipgloss.Width(right)
+		if pad < 0 {
+			pad = 0
+		}
+		return left + strings.Repeat(" ", pad) + right
 
 	default:
 		if m.confirmingExit {
@@ -468,17 +1061,98 @@ func (m model) renderStatusBar() string {
 			}
 			return msg + strings.Repeat(" ", pad) + keys
 		}
+		if m.turnSelectMode {
+			sel := styleWarning.Render(fmt.Sprintf("● Turn %d/%d", m.selectedTurn+1, m.turn))
+			keys := styleDim.Render(" ↑↓=navigate  d=dismiss  u=useful  c/Esc=cancel ")
+			pad := m.width - lipgloss.Width(sel) - lipgloss.Width(keys)
+			if pad < 0 {
+				pad = 0
+			}
+			return sel + strings.Repeat(" ", pad) + keys
+		}
 		ready := styleStatusBg.Render("● Ready")
-		keys := styleDim.Render(" ↑↓ scroll  Ctrl+D exit  Ctrl+C cancel ")
-		pad := m.width - lipgloss.Width(ready) - lipgloss.Width(keys)
+		keys := styleDim.Render(" ↑↓ scroll  Ctrl+T tools  Ctrl+X marks  Ctrl+D exit ")
+		// Show context usage on right side when there are completed turns.
+		var ctxInfo string
+		if m.turn > 0 {
+			inCtx, pct, saved, ctxWin := m.contextStats()
+			if inCtx > 0 {
+				if ctxWin > 0 {
+					ctxInfo = styleDim.Render(" ctx: ") + styleMuted.Render(fmt.Sprintf("%d%% · %s/%s", pct, fmtTokens(inCtx), fmtTokens(ctxWin)))
+				} else {
+					ctxInfo = styleDim.Render(" ctx: ") + styleMuted.Render(fmtTokens(inCtx))
+				}
+				if saved > 0 {
+					ctxInfo += styleDim.Render(" saved: ") + styleSuccess.Render(fmtTokens(saved))
+				}
+				ctxInfo += " "
+			}
+		}
+		right := ctxInfo + keys
+		pad := m.width - lipgloss.Width(ready) - lipgloss.Width(right)
 		if pad < 0 {
 			pad = 0
 		}
-		return ready + strings.Repeat(" ", pad) + keys
+		return ready + strings.Repeat(" ", pad) + right
 	}
 }
 
+func (m model) renderModelPicker() string {
+	opts := m.cfg.ProviderOptions
+	hasAdd := m.cfg.AddProviderFn != nil
+	var sb strings.Builder
+	sb.WriteString(styleSystem.Render("/model") + styleDim.Render("  ↑↓ j/k · Enter · Esc=cancel") + "\n")
+	for i, o := range opts {
+		if i == m.pickerCursor {
+			sb.WriteString(styleAssistant.Render("▶ " + o.Label))
+		} else {
+			sb.WriteString(styleDim.Render("  " + o.Label))
+		}
+		sb.WriteString("\n")
+	}
+	if hasAdd {
+		addLabel := "＋ Add new provider…"
+		if m.pickerCursor == len(opts) {
+			sb.WriteString(styleAssistant.Render("▶ " + addLabel))
+		} else {
+			sb.WriteString(styleDim.Render("  " + addLabel))
+		}
+	}
+	return styleApprovalBorder.Width(m.width - 2).Render(sb.String())
+}
+
+func (m model) renderAutocompleteDropdown() string {
+	var sb strings.Builder
+	for i, item := range m.acItems {
+		label := item
+		desc := ""
+		if idx := strings.Index(item, "\t"); idx >= 0 {
+			label = item[:idx]
+			desc = item[idx+1:]
+		}
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		if i == m.acCursor {
+			sb.WriteString(styleAssistant.Render("▶ " + label))
+			if desc != "" {
+				sb.WriteString(styleDim.Render("  " + desc))
+			}
+		} else {
+			sb.WriteString(styleDim.Render("  " + label))
+			if desc != "" {
+				sb.WriteString(styleDim.Render("  " + desc))
+			}
+		}
+	}
+	hint := styleDim.Render("Tab=confirm  ↑↓=navigate  Esc=close")
+	return styleBorder.Width(m.width - 2).Render(sb.String() + "\n" + hint)
+}
+
 func (m model) renderInput() string {
+	if m.pickingModel {
+		return m.renderModelPicker()
+	}
 	if m.awaitingApproval {
 		req := m.pendingReq
 		icon := toolIcon(req.ToolName)
@@ -505,17 +1179,26 @@ func (m model) renderInput() string {
 	if m.agentRunning {
 		return styleBorder.Width(m.width - 2).Render(styleDim.Render("(agent running… Ctrl+D to interrupt)"))
 	}
-	return styleBorder.Width(m.width - 2).Render(m.textarea.View())
+	if m.suspended {
+		return styleBorder.Width(m.width - 2).Render(m.textarea.View())
+	}
+	inputBox := styleBorder.Width(m.width - 2).Render(m.textarea.View())
+	if m.acActive && len(m.acItems) > 0 {
+		return lipgloss.JoinVertical(lipgloss.Left, m.renderAutocompleteDropdown(), inputBox)
+	}
+	return inputBox
 }
 
 // ── agent start ───────────────────────────────────────────────────────────────
 
 func (m *model) startAgent(prompt string) tea.Cmd {
 	m.agentRunning = true
-	m.currentDelta.Reset()
+	m.currentDelta = ""
 	m.toolCalls = nil
 	m.startedAt = time.Now()
-	m.appendHistory("user", prompt)
+	m.liveTokens = 0
+	m.liveCost = 0
+	m.appendHistory("user", prompt, provider.TokenUsage{}, 0)
 	m.refreshViewport()
 	m.viewport.GotoBottom()
 	m.status = "thinking…"
@@ -532,57 +1215,197 @@ func (m *model) startAgent(prompt string) tea.Cmd {
 	deltaCh := make(chan string, 128)
 	toolCallCh := make(chan toolCallMsg, 16)
 	doneCh := make(chan agentDoneMsg, 1)
+	suspendCh := make(chan agent.SuspendSignal, 1)
+	resumeCh := make(chan string, 1)
+	m.suspendCh = suspendCh
+	m.resumeCh = resumeCh
+
+	// Initialise a checkpoint recorder for this run (non-fatal if it fails).
+	var ckptRecorder *checkpoint.Recorder
+	ckptDir := filepath.Join(m.cfg.WorkDir, ".polvo", "checkpoints")
+	ckptStore := checkpoint.NewFSStore(ckptDir)
+	ckptSessionID := fmt.Sprintf("tui-%d", time.Now().UnixNano())
+	if rec, err := checkpoint.NewRecorder(ckptStore, ckptSessionID, "tui"); err == nil {
+		ckptRecorder = rec
+	}
+
+	// Load microagents for context injection.
+	homeDir, _ := os.UserHomeDir()
+	maLoader := microagent.NewLoader(
+		filepath.Join(m.cfg.WorkDir, ".polvo", "microagents"),
+		filepath.Join(homeDir, ".polvo", "microagents"),
+	)
+
+	// Capture the current TUI turn count so loop-relative turn indices can be
+	// translated to global TUI turn indices in callbacks.
+	tuiTurnOffset := m.turn
+	m.convTurnOffset = m.turn
+
+	model := m.cfg.Model
+
+	system := m.cfg.System
+	if m.cfg.SummaryModel == "" {
+		// No dedicated summary model — ask the main model to include inline summaries.
+		system += agent.InlineSummarySystemSuffix
+	}
 
 	loopCfg := agent.LoopConfig{
 		Provider:           m.cfg.Provider,
 		Tools:              m.cfg.ToolReg,
-		System:             m.cfg.System,
-		Model:              m.cfg.Model,
+		System:             system,
+		Model:              model,
 		MaxTurns:           maxTurns,
 		PermissionCallback: m.perm,
+		Checkpoint:         ckptRecorder,
+		MicroagentLoader:   maLoader,
+		SuspendCh:          suspendCh,
+		ResumeCh:           resumeCh,
+		InlineSummary:      m.cfg.SummaryModel == "",
+		OnText: func(text string) {
+			// Called when the provider does NOT support streaming (full response at once).
+			// Split into small chunks so the delta path is used for display.
+			select {
+			case deltaCh <- text:
+			case <-ctx.Done():
+			}
+		},
 		OnTextDelta: func(d string) {
-			deltaCh <- d
+			select {
+			case deltaCh <- d:
+			case <-ctx.Done():
+			}
 		},
 		OnToolCall: func(c provider.ToolCall) {
 			toolCallCh <- toolCallMsg{
 				name:    c.Name,
-				preview: truncate(string(c.Input), 120),
+				preview: formatToolInput(c.Name, c.Input),
 			}
 		},
-		OnToolResult: func(_, name, _ string, isError bool) {
-			toolCallCh <- toolCallMsg{name: name, done: true, isError: isError}
+		OnToolResult: func(_, name, result string, isError bool) {
+			// find start time from pending entry to compute duration
+			toolCallCh <- toolCallMsg{
+				name:    name,
+				done:    true,
+				isError: isError,
+				output:  firstMeaningfulLine(result, 120),
+			}
+		},
+		OnTurnSummary: func(turnIdx int, summary string) {
+			// turnIdx is 0-based within this run; add the TUI turn offset.
+			prog.Send(turnSummaryDoneMsg{turnIdx: tuiTurnOffset + turnIdx, summary: summary})
+		},
+		OnRetry: func(err error, attempt int, delay time.Duration) {
+			prog.Send(providerRetryMsg{
+				attempt:     attempt,
+				maxAttempts: 5,
+				delay:       delay,
+				deadline:    time.Now().Add(delay),
+				errText:     friendlyError(err.Error()),
+			})
 		},
 	}
 
 	l := agent.NewLoop(loopCfg)
 
+	// Expose conversation and checkpoint store for turn mark operations.
+	m.conv = l.Conv()
+	m.ckptStore = ckptStore
+	m.ckptSessionID = ckptSessionID
+
+	// Propagate any existing turn marks from previous runs into the new conversation.
+	// TUI turn index = tuiTurnOffset + conv turn index, so conv index = TUI index - tuiTurnOffset.
+	for tuiIdx, meta := range m.turnMarks {
+		convIdx := tuiIdx - tuiTurnOffset
+		if convIdx >= 0 {
+			m.conv.SetMark(convIdx, meta.Mark, meta.Summary)
+		}
+	}
+
+	// Resolve @@task[...] / @@question[...] references before sending to the model.
+	var resolver *session.Resolver
+	if m.cfg.SessionManager != nil {
+		resolver = session.NewResolver(m.cfg.SessionManager, m.cfg.SummaryRunner)
+	}
+
 	go func() {
-		_, err := l.Run(ctx, prompt)
-		doneCh <- agentDoneMsg{err: err}
+		resolvedPrompt := prompt
+		if resolver != nil && session.HasRefs(prompt) {
+			if rp, rerr := resolver.Resolve(ctx, prompt); rerr == nil {
+				resolvedPrompt = rp
+			}
+		}
+		res, err := l.Run(ctx, resolvedPrompt)
+		if ckptRecorder != nil {
+			status := "completed"
+			if err != nil {
+				status = "failed"
+			}
+			_ = ckptRecorder.Finish(status)
+		}
+		done := agentDoneMsg{err: err}
+		if res != nil {
+			done.tokensUsed = res.TokensUsed
+			done.costUSD = provider.ComputeCostUSD(res.TokensUsed, model)
+		}
+		doneCh <- done
 	}()
 
 	go func() {
 		defer cancel()
+		// track start times per tool name to compute duration
+		startTimes := map[string]time.Time{}
+		// batch deltas every 50ms to avoid saturating the bubbletea event loop
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		var pending strings.Builder
+		flush := func() {
+			if pending.Len() > 0 {
+				prog.Send(agentDeltaMsg{delta: pending.String()})
+				pending.Reset()
+			}
+		}
 		for {
 			select {
+			case <-ctx.Done():
+				// Context cancelled — drain remaining deltas and exit.
+				flush()
+				return
 			case d, ok := <-deltaCh:
 				if ok {
-					prog.Send(agentDeltaMsg{delta: d})
+					pending.WriteString(d)
+				}
+			case <-ticker.C:
+				flush()
+			case sig, ok := <-suspendCh:
+				if ok {
+					flush()
+					prog.Send(agentSuspendedMsg{signal: sig})
 				}
 			case tc, ok := <-toolCallCh:
 				if ok {
+					flush() // send any buffered delta before tool msg
+					if !tc.done {
+						startTimes[tc.name] = time.Now()
+					} else {
+						if st, found := startTimes[tc.name]; found {
+							tc.dur = time.Since(st)
+							delete(startTimes, tc.name)
+						}
+					}
 					prog.Send(tc)
 				}
 			case done := <-doneCh:
+				// Drain remaining deltas before signalling done.
+			drainLoop:
 				for {
 					select {
 					case d := <-deltaCh:
-						prog.Send(agentDeltaMsg{delta: d})
+						pending.WriteString(d)
 					default:
-						goto sendDone
+						break drainLoop
 					}
 				}
-			sendDone:
+				flush()
 				prog.Send(done)
 				return
 			}
@@ -592,27 +1415,231 @@ func (m *model) startAgent(prompt string) tea.Cmd {
 	return nil
 }
 
+// ── work item commands ────────────────────────────────────────────────────────
+
+// startWorkItem handles /task <prompt> and /question <prompt> commands.
+// It finishes the active work item, creates a new one, resets conversation
+// context, and starts the agent with the given prompt.
+func (m *model) startWorkItem(cmd string) tea.Cmd {
+	var kind session.Kind
+	var body string
+	if after, ok := strings.CutPrefix(cmd, "/task "); ok {
+		kind = session.KindTask
+		body = strings.TrimSpace(after)
+	} else if after, ok := strings.CutPrefix(cmd, "/question "); ok {
+		kind = session.KindQuestion
+		body = strings.TrimSpace(after)
+	} else {
+		return nil
+	}
+	if body == "" {
+		return nil
+	}
+
+	ctx := m.ctx
+
+	// Finish any active work item.
+	if m.activeWorkItemID != "" {
+		_ = m.cfg.SessionManager.Finish(ctx, m.activeWorkItemID)
+	}
+
+	// Create new work item.
+	wi, err := m.cfg.SessionManager.Start(ctx, kind, body)
+	if err != nil {
+		m.appendHistory("error", "work item: "+err.Error(), provider.TokenUsage{}, 0)
+		m.refreshViewport()
+		return nil
+	}
+	m.activeWorkItemID = wi.ID
+
+	// Start async summary.
+	if m.cfg.SummaryRunner != nil {
+		m.cfg.SummaryRunner.StartAsync(ctx, wi)
+	}
+
+	// Reset conversation context.
+	m.history = ""
+	m.turn = 0
+	m.liveTokens = 0
+	m.liveCost = 0
+	m.lastPromptTokens = 0
+	m.toolCalls = nil
+	m.currentDelta = ""
+	m.historyEntries = nil
+	m.conv = nil
+	m.turnMarks = nil
+	m.turnSelectMode = false
+	m.selectedTurn = -1
+
+	// Banner in history.
+	bannerText := string(kind) + " " + wi.ID + ": " + body
+	m.appendHistory("system", bannerText, provider.TokenUsage{}, 0)
+	m.refreshViewport()
+
+	return m.startAgent(body)
+}
+
+
+// ── turn marks ────────────────────────────────────────────────────────────────
+
+// generateTurnSummary returns a tea.Cmd that generates a summary for the given
+// turn asynchronously, using the dedicated summary model when configured or the
+// main model otherwise.
+func (m *model) generateTurnSummary(ctx context.Context, turnIdx int) tea.Cmd {
+	userText, assistantText := m.turnTexts(turnIdx)
+	if userText == "" && assistantText == "" {
+		return nil
+	}
+
+	p := m.cfg.Provider
+	mdl := m.cfg.Model
+	if m.cfg.SummaryProvider != nil && m.cfg.SummaryModel != "" {
+		p = m.cfg.SummaryProvider
+		mdl = m.cfg.SummaryModel
+	}
+
+	return func() tea.Msg {
+		summary, err := agent.SummarizeTurn(ctx, p, mdl, userText, assistantText)
+		return turnSummaryDoneMsg{turnIdx: turnIdx, summary: summary, err: err, userRequested: true}
+	}
+}
+
+// hasAnyMarks returns true if any completed turn has a non-default mark.
+
+// buildTurnHistoryText returns a plain-text concatenation of user and assistant
+// messages from historyEntries, suitable as input for skill extraction.
+func (m model) buildTurnHistoryText() string {
+	var sb strings.Builder
+	for _, e := range m.historyEntries {
+		switch e.role {
+		case "user":
+			sb.WriteString("User: " + e.text + "\n")
+		case "assistant":
+			sb.WriteString("Assistant: " + e.text + "\n")
+		}
+	}
+	return sb.String()
+}
+
+// persistTurnMarks saves all current turn marks to the checkpoint store.
+func (m *model) persistTurnMarks() {
+	if m.ckptStore == nil || m.ckptSessionID == "" {
+		return
+	}
+	var records []checkpoint.TurnMarkRecord
+	for i, meta := range m.turnMarks {
+		if meta.Mark != agent.TurnMarkNone {
+			records = append(records, checkpoint.TurnMarkRecord{
+				TurnIndex: i,
+				Mark:      int8(meta.Mark),
+				Summary:   meta.Summary,
+			})
+		}
+	}
+	_ = m.ckptStore.SaveTurnMarks(m.ckptSessionID, records)
+}
+
+// setTurnMark sets a mark in the TUI-local turnMarks map (indexed by TUI turn index).
+// Also propagates to m.conv when available for context-compression.
+func (m *model) setTurnMark(idx int, mark agent.TurnMark, summary string) {
+	if m.turnMarks == nil {
+		m.turnMarks = make(map[int]agent.TurnMetadata)
+	}
+	m.turnMarks[idx] = agent.TurnMetadata{Index: idx, Mark: mark, Summary: summary}
+	// Propagate to the current conversation using the conv-relative index.
+	if m.conv != nil {
+		convIdx := idx - m.convTurnOffset
+		if convIdx >= 0 {
+			m.conv.SetMark(convIdx, mark, summary)
+		}
+	}
+}
+
+// getTurnMark returns the mark for a TUI turn index.
+func (m *model) getTurnMark(idx int) agent.TurnMetadata {
+	if m.turnMarks == nil {
+		return agent.TurnMetadata{Index: idx}
+	}
+	if meta, ok := m.turnMarks[idx]; ok {
+		return meta
+	}
+	return agent.TurnMetadata{Index: idx}
+}
+
+// turnTexts returns the user and assistant text for a TUI turn index
+// by scanning historyEntries (works across multiple agent runs).
+func (m *model) turnTexts(idx int) (userText, assistantText string) {
+	for _, e := range m.historyEntries {
+		if e.turnIdx != idx {
+			continue
+		}
+		switch e.role {
+		case "user":
+			userText = e.text
+		case "assistant":
+			assistantText = e.text
+		}
+	}
+	return
+}
+
 // ── history rendering ─────────────────────────────────────────────────────────
 
-func (m *model) appendHistory(role, text string) {
+func (m *model) appendHistory(role, text string, tokens provider.TokenUsage, costUSD float64) {
+	// Record structured entry before rendering.
+	// user and assistant entries get a turnIdx; others get -1.
+	turnIdx := -1
+	switch role {
+	case "user":
+		// This user message will start turn m.turn (0-based).
+		turnIdx = m.turn
+	case "assistant":
+		// This closes the turn that started with turn m.turn.
+		turnIdx = m.turn
+	case "tools":
+		// Tool entries belong to the current turn.
+		turnIdx = m.turn
+	}
+	m.historyEntries = append(m.historyEntries, historyEntry{
+		role:    role,
+		text:    text,
+		turnIdx: turnIdx,
+		tokens:  tokens,
+		cost:    costUSD,
+	})
+
+	w := m.width - 2 // -2 for left border + padding
+	if w < 20 {
+		w = 20
+	}
 	var line string
 	switch role {
 	case "user":
 		label := styleUser.Render("You")
 		body := styleMuted.Render(text)
-		line = styleUserBlock.Render(label + "\n" + body)
+		line = styleUserBlock.Width(w).Render(label + "\n" + body)
 	case "assistant":
 		label := styleAssistant.Render("Polvo")
-		line = styleAssistantBlock.Render(label + "\n" + text)
+		body := label + "\n" + text
+		if tokens.TotalTokens > 0 {
+			footer := fmtTokens(tokens.TotalTokens)
+			if costUSD > 0 {
+				footer += " · " + fmtCost(costUSD)
+			}
+			body += "\n" + styleDim.Render("✦ "+footer)
+		}
+		line = styleAssistantBlock.Width(w).Render(body)
 		m.turn++
 	case "error":
 		label := styleError.Render("Error")
-		line = styleErrorBlock.Render(label + "\n" + styleError.Render(text))
+		line = styleErrorBlock.Width(w).Render(label + "\n" + styleError.Render(text))
+	case "system":
+		line = styleErrorBlock.Width(w).Render(styleDim.Render("· " + text))
 	case "tools":
 		label := styleSystem.Render("Tools Used")
-		line = styleToolBlock.Render(label + "\n" + text)
+		line = styleToolBlock.Width(w).Render(label + "\n" + text)
 	}
-	
+
 	if m.history != "" {
 		m.history += "\n"
 	}
@@ -623,12 +1650,49 @@ func (m *model) appendToolSummary() {
 	if len(m.toolCalls) == 0 {
 		return
 	}
+	// Store raw calls so renderEntry can re-render when showTools is toggled.
+	calls := make([]toolEntry, len(m.toolCalls))
+	copy(calls, m.toolCalls)
+	m.historyEntries = append(m.historyEntries, historyEntry{
+		role:    "tools",
+		turnIdx: m.turn,
+		calls:   calls,
+	})
+	// Also append to the rendered history string.
+	w := m.width - 2
+	if w < 20 {
+		w = 20
+	}
+	label := styleSystem.Render("Tools Used")
+	text := m.renderToolList(calls, false)
+	line := styleToolBlock.Width(w).Render(label + "\n" + text)
+	if m.history != "" {
+		m.history += "\n"
+	}
+	m.history += line
+}
+
+// renderToolList renders the tool call list for display.
+// When collapsed (showTools=false), shows only a compact summary line.
+func (m *model) renderToolList(calls []toolEntry, hasPending bool) string {
+	if !m.showTools {
+		// collapsed: show count + names inline
+		names := make([]string, 0, len(calls))
+		for _, tc := range calls {
+			names = append(names, tc.name)
+		}
+		toggle := styleDim.Render(" Ctrl+T to expand")
+		return styleSystem.Render(fmt.Sprintf("%d tools", len(calls))) +
+			styleDim.Render("  "+strings.Join(names, " › ")) + toggle
+	}
+
 	var sb strings.Builder
-	for i, tc := range m.toolCalls {
+	for i, tc := range calls {
 		if i > 0 {
 			sb.WriteString("\n")
 		}
 		icon := toolIcon(tc.name)
+
 		if tc.done {
 			if tc.isError {
 				sb.WriteString(styleError.Render("✗ " + icon + " " + tc.name))
@@ -638,53 +1702,404 @@ func (m *model) appendToolSummary() {
 		} else {
 			sb.WriteString(styleSystem.Render("· " + icon + " " + tc.name))
 		}
+
 		if tc.preview != "" {
 			sb.WriteString(styleDim.Render("  " + truncate(tc.preview, 60)))
 		}
+
+		if tc.dur > 0 {
+			sb.WriteString(styleDim.Render("  " + fmtDuration(tc.dur)))
+		}
+
+		if tc.done && tc.output != "" {
+			sb.WriteString("\n")
+			if tc.isError {
+				sb.WriteString(styleError.Render("  " + truncate(tc.output, 100)))
+			} else {
+				sb.WriteString(styleDim.Render("  " + truncate(tc.output, 100)))
+			}
+		}
 	}
-	m.appendHistory("tools", sb.String())
+	return sb.String()
+}
+
+// rebuildHistory reconstructs the history string from historyEntries, applying
+// turn mark visuals (selected, useful, dismissed). Called when marks or selection
+// may have changed.
+func (m *model) rebuildHistory() {
+	w := m.width - 2
+	if w < 20 {
+		w = 20
+	}
+	var sb strings.Builder
+	// Track whether we already emitted a dismissed stub for this turn.
+	dismissedSeen := make(map[int]bool)
+
+	for _, e := range m.historyEntries {
+		var line string
+
+		if e.turnIdx >= 0 {
+			meta := m.getTurnMark(e.turnIdx)
+			dismissed := meta.Mark == agent.TurnMarkDismissed
+			useful := meta.Mark == agent.TurnMarkUseful
+			selected := m.turnSelectMode && m.selectedTurn == e.turnIdx
+
+			if dismissed {
+				if dismissedSeen[e.turnIdx] {
+					continue // only emit stub once per turn
+				}
+				dismissedSeen[e.turnIdx] = true
+				summary := meta.Summary
+				if summary == "" {
+					summary = "generating summary…"
+				}
+				if selected {
+					stub := styleWarning.Render("▶ ") + styleDim.Render(fmt.Sprintf("[turn %d dismissed · %s · d=restore]", e.turnIdx+1, truncate(summary, 50)))
+					line = styleSelectedBlock.Width(w).Render(stub)
+				} else {
+					stub := styleDim.Render(fmt.Sprintf("[turn %d dismissed · %s]", e.turnIdx+1, truncate(summary, 60)))
+					line = styleDismissedBlock.Width(w).Render(stub)
+				}
+			} else {
+				// Render normally, with mark-aware style.
+				line = m.renderEntry(e, w)
+				if selected && useful {
+					// Already useful and selected: thick border (selection) + star icon.
+					line = styleSelectedBlock.Width(w).Render(
+						indentLines(m.renderEntryInner(e), styleWarning.Render("★ "), "  "),
+					)
+				} else if selected {
+					line = styleSelectedBlock.Width(w).Render(
+						indentLines(m.renderEntryInner(e), styleWarning.Render("▶ "), "  "),
+					)
+				} else if useful {
+					line = styleUsefulBlock.Width(w).Render(
+						indentLines(m.renderEntryInner(e), styleWarning.Render("★ "), "  "),
+					)
+				}
+			}
+		} else {
+			line = m.renderEntry(e, w)
+		}
+
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(line)
+	}
+	m.history = sb.String()
+}
+
+// renderEntryInner renders the inner content of a history entry (no block border).
+func (m *model) renderEntryInner(e historyEntry) string {
+	switch e.role {
+	case "user":
+		return styleUser.Render("You") + "\n" + styleMuted.Render(e.text)
+	case "assistant":
+		body := styleAssistant.Render("Polvo") + "\n" + e.text
+		if e.tokens.TotalTokens > 0 {
+			footer := fmtTokens(e.tokens.TotalTokens)
+			if e.cost > 0 {
+				footer += " · " + fmtCost(e.cost)
+			}
+			body += "\n" + styleDim.Render("✦ "+footer)
+		}
+		return body
+	case "tools":
+		text := e.text
+		if len(e.calls) > 0 {
+			text = m.renderToolList(e.calls, false)
+		}
+		return styleSystem.Render("Tools Used") + "\n" + text
+	default:
+		return e.text
+	}
+}
+
+// renderEntry renders a history entry into a styled block string.
+func (m *model) renderEntry(e historyEntry, w int) string {
+	switch e.role {
+	case "user":
+		label := styleUser.Render("You")
+		body := styleMuted.Render(e.text)
+		return styleUserBlock.Width(w).Render(label + "\n" + body)
+	case "assistant":
+		label := styleAssistant.Render("Polvo")
+		body := label + "\n" + e.text
+		if e.tokens.TotalTokens > 0 {
+			footer := fmtTokens(e.tokens.TotalTokens)
+			if e.cost > 0 {
+				footer += " · " + fmtCost(e.cost)
+			}
+			body += "\n" + styleDim.Render("✦ "+footer)
+		}
+		return styleAssistantBlock.Width(w).Render(body)
+	case "error":
+		label := styleError.Render("Error")
+		return styleErrorBlock.Width(w).Render(label + "\n" + styleError.Render(e.text))
+	case "system":
+		return styleErrorBlock.Width(w).Render(styleDim.Render("· " + e.text))
+	case "tools":
+		label := styleSystem.Render("Tools Used")
+		text := e.text
+		if len(e.calls) > 0 {
+			text = m.renderToolList(e.calls, false)
+		}
+		return styleToolBlock.Width(w).Render(label + "\n" + text)
+	}
+	return e.text
 }
 
 func (m *model) refreshViewport() {
 	content := m.history
 
-	// live tool calls being executed
+	// live tool calls: show Running block while any tool is still pending
 	if len(m.toolCalls) > 0 {
-		var sb strings.Builder
-		for i, tc := range m.toolCalls {
-			if i > 0 {
-				sb.WriteString("\n")
-			}
-			icon := toolIcon(tc.name)
-			if tc.done {
-				if tc.isError {
-					sb.WriteString(styleError.Render("✗ " + icon + " " + tc.name))
-				} else {
-					sb.WriteString(styleSuccess.Render("✓ " + icon + " " + tc.name))
-				}
-			} else {
-				sb.WriteString(styleSystem.Render("· " + icon + " " + tc.name))
-				if tc.preview != "" {
-					sb.WriteString(styleDim.Render("  " + truncate(tc.preview, 60)))
-				}
+		hasPending := false
+		for _, tc := range m.toolCalls {
+			if !tc.done {
+				hasPending = true
+				break
 			}
 		}
+
 		if content != "" {
 			content += "\n"
 		}
-		content += styleToolBlock.Render(styleSystem.Render("Running") + "\n" + sb.String())
+		label := styleSystem.Render("Running")
+		if !hasPending {
+			label = styleSystem.Render("Tools Used")
+		}
+		w := m.width - 2
+		if w < 20 {
+			w = 20
+		}
+		content += styleToolBlock.Width(w).Render(label + "\n" + m.renderToolList(m.toolCalls, hasPending))
 	}
 
-	// streaming assistant response
-	if m.currentDelta.Len() > 0 {
-		if content != "" {
-			content += "\n"
+	// streaming assistant response — only show after all tools are done
+	if m.currentDelta != "" {
+		allDone := true
+		for _, tc := range m.toolCalls {
+			if !tc.done {
+				allDone = false
+				break
+			}
 		}
-		label := styleAssistant.Render("Polvo")
-		content += styleAssistantBlock.Render(label + "\n" + m.currentDelta.String())
+		if allDone {
+			if content != "" {
+				content += "\n"
+			}
+			label := styleAssistant.Render("Polvo")
+			w := m.width - 2
+			if w < 20 {
+				w = 20
+			}
+			content += styleAssistantBlock.Width(w).Render(label + "\n" + m.currentDelta)
+		}
 	}
 
 	m.viewport.SetContent(content)
+}
+
+// ── autocomplete ─────────────────────────────────────────────────────────────
+
+// slashCommands lists all available slash commands with their descriptions.
+var slashCommands = []struct{ cmd, desc string }{
+	{"/model", "switch provider or model"},
+	{"/task", "start a new task (resets context)"},
+	{"/question", "start a new question (resets context)"},
+	{"/pause", "suspend the agent and wait for guidance"},
+	{"/clear", "clear conversation history"},
+	{"/help", "show keyboard shortcuts"},
+}
+
+// acComputeItems returns completion candidates for the current input value.
+// Returns nil (no autocomplete) when the input doesn't match a trigger.
+func (m *model) acComputeItems(val string) []string {
+	// slash command completion: triggered when input starts with "/"
+	if strings.HasPrefix(val, "/") && !strings.Contains(val, " ") {
+		prefix := strings.ToLower(val)
+		var out []string
+		for _, sc := range slashCommands {
+			if strings.HasPrefix(sc.cmd, prefix) {
+				out = append(out, sc.cmd+"\t"+sc.desc)
+			}
+		}
+		return out
+	}
+
+	// @@ work item completion: triggered after "@@"
+	if m.cfg.SessionManager != nil {
+		if aaIdx := strings.LastIndex(val, "@@"); aaIdx >= 0 {
+			partial := val[aaIdx+2:]
+			if !strings.Contains(partial, "]") {
+				// strip leading @@task[ or @@question[ prefix
+				kindPrefix := ""
+				if strings.HasPrefix(partial, "task[") {
+					kindPrefix = "task["
+					partial = partial[5:]
+				} else if strings.HasPrefix(partial, "question[") {
+					kindPrefix = "question["
+					partial = partial[9:]
+				}
+				items, _ := m.cfg.SessionManager.ListRecent(context.Background(), 20)
+				var out []string
+				for _, wi := range items {
+					if kindPrefix != "" && !strings.HasPrefix(wi.ID, strings.TrimSuffix(kindPrefix, "[")) {
+						continue
+					}
+					if strings.HasPrefix(wi.ID, string(wi.Kind)+"#"+partial) || partial == "" {
+						desc := wi.Summary
+						if desc == "" {
+							desc = wi.Prompt
+						}
+						if len(desc) > 60 {
+							desc = desc[:57] + "…"
+						}
+						out = append(out, "@@"+string(wi.Kind)+"["+wi.ID+"]\t"+desc)
+					}
+				}
+				if len(out) > 0 {
+					return out
+				}
+			}
+		}
+	}
+
+	// @ file path completion: triggered after the last "@" (but not "@@")
+	atIdx := strings.LastIndex(val, "@")
+	if atIdx < 0 {
+		return nil
+	}
+	// skip if this "@" is actually part of "@@"
+	if atIdx > 0 && val[atIdx-1] == '@' {
+		return nil
+	}
+	if atIdx+1 < len(val) && val[atIdx+1] == '@' {
+		return nil
+	}
+	partial := val[atIdx+1:]
+	if strings.Contains(partial, " ") {
+		return nil // already completed (space after path)
+	}
+
+	pattern := filepath.Join(m.cfg.WorkDir, partial+"*")
+	matches, err := filepath.Glob(pattern)
+	if err != nil || len(matches) == 0 {
+		return nil
+	}
+	sort.Strings(matches)
+	if len(matches) > 12 {
+		matches = matches[:12]
+	}
+	out := make([]string, len(matches))
+	for i, p := range matches {
+		rel, err := filepath.Rel(m.cfg.WorkDir, p)
+		if err != nil {
+			rel = p
+		}
+		// append "/" to directories for clarity
+		if info, err := os.Stat(p); err == nil && info.IsDir() {
+			rel += "/"
+		}
+		out[i] = rel
+	}
+	return out
+}
+
+// acApply replaces the relevant portion of the input with the selected item.
+func (m *model) acApply(item string) {
+	// strip description from slash commands and @@ refs (tab-separated)
+	if idx := strings.Index(item, "\t"); idx >= 0 {
+		item = item[:idx]
+	}
+	val := m.textarea.Value()
+
+	if strings.HasPrefix(val, "/") {
+		m.textarea.SetValue(item + " ")
+		return
+	}
+
+	// @@ work item ref: item looks like "@@task[task#01]"
+	if strings.HasPrefix(item, "@@") {
+		aaIdx := strings.LastIndex(val, "@@")
+		if aaIdx >= 0 {
+			m.textarea.SetValue(val[:aaIdx] + item)
+		}
+		return
+	}
+
+	atIdx := strings.LastIndex(val, "@")
+	if atIdx >= 0 {
+		m.textarea.SetValue(val[:atIdx+1] + item)
+	}
+}
+
+// ── tool input formatting ─────────────────────────────────────────────────────
+
+// formatToolInput extracts the most meaningful field from a tool's JSON input
+// to display a clean, human-readable summary instead of raw JSON.
+func formatToolInput(name string, input json.RawMessage) string {
+	if len(input) == 0 {
+		return ""
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(input, &fields); err != nil {
+		return truncate(string(input), 80)
+	}
+
+	// primary field by tool name
+	primary := map[string]string{
+		"bash":       "command",
+		"read":       "file_path",
+		"write":      "file_path",
+		"edit":       "file_path",
+		"glob":       "pattern",
+		"grep":       "pattern",
+		"ls":         "path",
+		"web_fetch":  "url",
+		"web_search": "query",
+		"think":      "thought",
+		"diff":       "file_path",
+		"patch":      "file_path",
+	}
+
+	if key, ok := primary[name]; ok {
+		if raw, found := fields[key]; found {
+			var s string
+			if err := json.Unmarshal(raw, &s); err == nil && s != "" {
+				return truncate(s, 80)
+			}
+		}
+		// field exists in schema but was empty/absent — show workdir placeholder
+		return "./"
+	}
+
+	// fallback: first non-empty string value
+	for _, raw := range fields {
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil && s != "" {
+			return truncate(s, 80)
+		}
+	}
+
+	// no displayable fields
+	return ""
+}
+
+// firstMeaningfulLine returns the first non-empty, non-whitespace line of s,
+// truncated to maxLen chars. Returns empty string if s is empty or error-like boilerplate.
+func firstMeaningfulLine(s string, maxLen int) string {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		return truncate(line, maxLen)
+	}
+	return ""
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -705,13 +2120,40 @@ func compactPath(p string) string {
 }
 
 func fmtDuration(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
 	if d < time.Minute {
 		return fmt.Sprintf("%ds", int(d.Seconds()))
 	}
 	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
 }
 
+func fmtTokens(n int) string {
+	if n >= 1000 {
+		return fmt.Sprintf("%.1fk tokens", float64(n)/1000)
+	}
+	return fmt.Sprintf("%d tokens", n)
+}
+
+func fmtCost(usd float64) string {
+	if usd < 0.001 {
+		return fmt.Sprintf("$%.4f", usd)
+	}
+	return fmt.Sprintf("$%.3f", usd)
+}
+
 func drainChan(_ agentDeltaMsg) tea.Cmd { return nil }
+
+// retryErrorMsg builds the full error message shown in history after retries.
+// cancelled=true when the user pressed Esc; false when retries were exhausted.
+func retryErrorMsg(errText string, attempts, maxAttempts int, cancelled bool) string {
+	suffix := fmt.Sprintf("(%d/%d retries)", attempts, maxAttempts)
+	if cancelled {
+		return fmt.Sprintf("%s — cancelled by user %s", errText, suffix)
+	}
+	return fmt.Sprintf("%s — gave up after %s", errText, suffix)
+}
 
 // friendlyError converts raw API error JSON/messages into readable one-liners.
 func friendlyError(msg string) string {
@@ -743,11 +2185,84 @@ func friendlyError(msg string) string {
 	if strings.Contains(msg, "context canceled") || strings.Contains(msg, "context cancelled") {
 		return "cancelled"
 	}
+	// network / TCP timeouts
+	if strings.Contains(msg, "operation timed out") || strings.Contains(msg, "i/o timeout") || strings.Contains(msg, "read tcp") {
+		return "connection timed out — the provider did not respond in time, try again"
+	}
+	// generic connection errors
+	if strings.Contains(msg, "connection refused") || strings.Contains(msg, "no such host") || strings.Contains(msg, "dial tcp") {
+		return "could not reach provider — check your internet connection"
+	}
+	// EOF during streaming
+	if strings.Contains(msg, "unexpected EOF") || strings.Contains(msg, "EOF") {
+		return "connection dropped mid-stream — try again"
+	}
 	// quota messages
 	if strings.Contains(msg, "RESOURCE_EXHAUSTED") || strings.Contains(msg, "quota") {
 		return "quota exhausted — check your plan or wait before retrying"
 	}
 	return msg
+}
+
+// contextStats returns context token usage, percentage of the context window used,
+// and tokens saved by dismissed marks.
+//
+// inContext  = real PromptTokens from last API response (0 if no response yet).
+// pct        = percentage of context window used (0 if context window unknown).
+// saved      = estimated tokens saved by dismissed turns.
+// contextWin = effective context window in tokens (cfg override → model table → 0).
+func (m model) contextStats() (inContext, pct, saved, contextWin int) {
+	// Prefer the real PromptTokens from the last API response.
+	inContext = m.lastPromptTokens
+	// Fall back to estimation if no real value yet.
+	if inContext == 0 && m.conv != nil {
+		inContext = provider.EstimateTokens(m.conv.Messages(), "")
+	}
+
+	// Resolve effective context window: config override takes priority.
+	contextWin = m.cfg.ContextWindow
+	if contextWin == 0 {
+		apiKey := ""
+		if kp, ok := m.cfg.Provider.(provider.KeyedProvider); ok {
+			apiKey = kp.APIKey()
+		}
+		contextWin = provider.ContextWindowForModelWithKey(m.cfg.Model, apiKey)
+	}
+	if contextWin > 0 && inContext > 0 {
+		pct = inContext * 100 / contextWin
+	}
+
+	// Compute savings only when dismissed marks exist.
+	if m.conv != nil {
+		hasDismissed := false
+		for i := 0; i < m.conv.TurnCount(); i++ {
+			if m.conv.GetMark(i).Mark == agent.TurnMarkDismissed {
+				hasDismissed = true
+				break
+			}
+		}
+		if hasDismissed {
+			var rawMsgs []provider.Message
+			for _, e := range m.historyEntries {
+				switch e.role {
+				case "user":
+					rawMsgs = append(rawMsgs, provider.Message{Role: "user", Content: e.text})
+				case "assistant":
+					rawMsgs = append(rawMsgs, provider.Message{Role: "assistant", Content: e.text})
+				case "tools":
+					for _, tc := range e.calls {
+						rawMsgs = append(rawMsgs, provider.Message{Role: "tool", Content: tc.output})
+					}
+				}
+			}
+			full := provider.EstimateTokens(rawMsgs, "")
+			compressed := provider.EstimateTokens(m.conv.Messages(), "")
+			if full > compressed {
+				saved = full - compressed
+			}
+		}
+	}
+	return
 }
 
 func truncate(s string, n int) string {
@@ -756,4 +2271,19 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return string(runes[:n]) + "…"
+}
+
+// indentLines prefixes the first line with `first` and all subsequent lines
+// with `rest`, keeping multi-line blocks visually aligned under the icon.
+func indentLines(s, first, rest string) string {
+	lines := strings.Split(s, "\n")
+	var sb strings.Builder
+	for i, line := range lines {
+		if i == 0 {
+			sb.WriteString(first + line)
+		} else {
+			sb.WriteString("\n" + rest + line)
+		}
+	}
+	return sb.String()
 }

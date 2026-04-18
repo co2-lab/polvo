@@ -10,15 +10,17 @@ import (
 // Recorder is a helper used by the agent loop to record events and create
 // checkpoints. It is created once per agent run.
 type Recorder struct {
-	store     *FSStore
-	sessionID string
-	mu        sync.Mutex
-	eventIdx  int // next event index (0-based, incremented after each append)
+	store      Saver
+	sessionID  string
+	mu         sync.Mutex
+	eventIdx   int            // next event index (0-based, incremented after each append)
+	pending    []PendingWrite // two-phase write buffer
+	pendingSeq int
 }
 
 // NewRecorder initialises a Recorder for the given session and writes the
 // initial base_state.json with status "running".
-func NewRecorder(store *FSStore, sessionID, agentName string) (*Recorder, error) {
+func NewRecorder(store Saver, sessionID, agentName string) (*Recorder, error) {
 	now := time.Now().UnixNano()
 	state := BaseState{
 		SessionID: sessionID,
@@ -126,6 +128,71 @@ func (r *Recorder) CreateCheckpoint(description string, filesSnapshot map[string
 	_ = r.appendEvent(EventCheckpoint, map[string]string{"checkpoint_id": id})
 
 	return id, nil
+}
+
+// RecordSuspend appends a suspend event to the log.
+func (r *Recorder) RecordSuspend(reason SuspendReason) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.appendEvent(EventSuspend, map[string]string{"reason": string(reason)})
+}
+
+// RecordResume appends a resume event with the human's input to the log.
+func (r *Recorder) RecordResume(humanInput string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.appendEvent(EventResume, map[string]string{"input": humanInput})
+}
+
+// BeginPendingWrite adds an event to the in-memory buffer without persisting.
+// Call FlushPending once the SuspendPoint is durably saved.
+func (r *Recorder) BeginPendingWrite(kind EventKind, payload any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	r.pending = append(r.pending, PendingWrite{
+		Kind:    kind,
+		Payload: json.RawMessage(raw),
+		Seq:     r.pendingSeq,
+	})
+	r.pendingSeq++
+}
+
+// FlushPending persists buffered writes in order, then clears the buffer.
+func (r *Recorder) FlushPending() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.pending) == 0 {
+		return nil
+	}
+	if err := r.store.PutPendingWrites(r.sessionID, r.pending); err != nil {
+		return err
+	}
+	for _, pw := range r.pending {
+		e := Event{
+			Kind:      pw.Kind,
+			Timestamp: time.Now().UnixNano(),
+			Payload:   pw.Payload,
+		}
+		if err := r.store.AppendEvent(r.sessionID, e); err != nil {
+			return err
+		}
+		r.eventIdx++
+	}
+	r.pending = r.pending[:0]
+	_ = r.store.ClearPendingWrites(r.sessionID)
+	return nil
+}
+
+// DiscardPending drops buffered writes without persisting them.
+func (r *Recorder) DiscardPending() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pending = r.pending[:0]
+	_ = r.store.ClearPendingWrites(r.sessionID)
 }
 
 // Finish updates base_state.json with the final status ("completed" or "failed").

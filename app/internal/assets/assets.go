@@ -26,3 +26,8 @@ func ReadConfig() ([]byte, error) {
 func ReadHook(name string) ([]byte, error) {
 	return fs.ReadFile(polvoEmbed.FS, "hooks/"+name)
 }
+
+// ReadModelPrices reads the bundled LiteLLM model prices snapshot.
+func ReadModelPrices() ([]byte, error) {
+	return fs.ReadFile(polvoEmbed.FS, "data/model_prices.json")
+}

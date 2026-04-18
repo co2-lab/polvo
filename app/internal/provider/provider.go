@@ -48,6 +48,12 @@ type ChatProvider interface {
 	Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error)
 }
 
+// KeyedProvider is an optional interface implemented by providers that carry an
+// API key. Used for context-window lookups against the provider's own API.
+type KeyedProvider interface {
+	APIKey() string
+}
+
 // Message represents a single message in a conversation.
 type Message struct {
 	Role       string       // "user", "assistant", "tool"

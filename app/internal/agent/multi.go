@@ -54,10 +54,11 @@ func RunParallel(ctx context.Context, exec *Executor, tasks []AgentTask, maxPara
 }
 
 // AggregateResults merges parallel agent results into a single Result.
-// Errors are collected into the summary; findings are concatenated.
+// Errors are collected into the summary; findings are merged via StateGraph
+// (thread-safe append reducer).
 func AggregateResults(results []AgentResult) *Result {
 	var sb strings.Builder
-	var findings []Finding
+	sg := NewStateGraph()
 	anyDecision := ""
 
 	for _, r := range results {
@@ -71,7 +72,9 @@ func AggregateResults(results []AgentResult) *Result {
 		if r.Result.Summary != "" {
 			fmt.Fprintf(&sb, "[%s] %s\n", r.AgentName, r.Result.Summary)
 		}
-		findings = append(findings, r.Result.Findings...)
+		if len(r.Result.Findings) > 0 {
+			sg.Findings.Update(r.Result.Findings)
+		}
 		if r.Result.Decision != "" {
 			anyDecision = r.Result.Decision
 		}
@@ -80,6 +83,6 @@ func AggregateResults(results []AgentResult) *Result {
 	return &Result{
 		Decision: anyDecision,
 		Summary:  strings.TrimRight(sb.String(), "\n"),
-		Findings: findings,
+		Findings: sg.Findings.Get(),
 	}
 }

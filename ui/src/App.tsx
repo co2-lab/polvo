@@ -3,7 +3,7 @@ import { useSSE } from './hooks/useSSE'
 import { useIDEStore } from './store/useIDEStore'
 import { WorkspaceTabs } from './components/layout/WorkspaceTabs'
 import { SidePanel } from './components/layout/SidePanel'
-import { WorkspaceArea } from './components/workspace/WorkspaceArea'
+import { WorkspaceArea, TerminalLayer } from './components/workspace/WorkspaceArea'
 import { FloatingDock, PinnedDock } from './components/layout/Dock'
 import { SettingsModal } from './components/settings/SettingsModal'
 import { DockManagerModal } from './components/layout/DockManagerModal'
@@ -207,6 +207,7 @@ export default function App() {
           onCancel={() => setShowCloseConfirm(false)}
         />
       )}
+      <TerminalLayer />
     </div>
   )
 }

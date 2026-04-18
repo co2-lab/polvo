@@ -8,9 +8,13 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/co2-lab/polvo/internal/agent/checkpoint"
+	"github.com/co2-lab/polvo/internal/agent/microagent"
 	"github.com/co2-lab/polvo/internal/audit"
+	"github.com/co2-lab/polvo/internal/hooks"
 	"github.com/co2-lab/polvo/internal/memory"
 	"github.com/co2-lab/polvo/internal/provider"
+	"github.com/co2-lab/polvo/internal/risk"
 	"github.com/co2-lab/polvo/internal/tool"
 )
 
@@ -30,6 +34,52 @@ type ContextFallbackConfig struct {
 	SummaryProvider provider.ChatProvider
 	// SummaryModel is the model to use for summarization.
 	SummaryModel string
+}
+
+// Phase identifies a named execution phase in a multi-phase loop.
+type Phase string
+
+const (
+	PhaseContext Phase = "context" // read-only exploration
+	PhasePlan    Phase = "plan"    // planning / reasoning
+	PhaseBuild   Phase = "build"   // implementation (full tools)
+	PhaseVerify  Phase = "verify"  // tests + lint
+	PhaseCommit  Phase = "commit"  // git commit
+)
+
+// PhaseBudget configures per-phase execution parameters.
+type PhaseBudget struct {
+	MaxTokens int    // token budget for this phase (0 = use LoopConfig.MaxTokens)
+	MaxTurns  int    // max turns (0 = use LoopConfig.MaxTurns)
+	Model     string // model override (empty = use LoopConfig.Model)
+}
+
+// SuspendSignal is sent on SuspendCh when the loop needs human input to continue.
+type SuspendSignal struct {
+	SessionID    string
+	CheckpointID string
+	Reason       checkpoint.SuspendReason
+	Preview      string // human-readable description of the situation
+}
+
+// LoopControl provides granular interrupt/abort/resume signalling for a running loop.
+// All channels are created by the caller; zero values (nil channels) are ignored.
+type LoopControl struct {
+	// Close (or send) to request a clean pause after the current tool batch.
+	Interrupt chan struct{}
+	// Close (or send) to abort the loop immediately (cancels context).
+	Abort chan struct{}
+	// Close (or send) to resume after a clean pause.
+	Resume chan struct{}
+}
+
+// NewLoopControl creates a LoopControl with all channels initialized.
+func NewLoopControl() *LoopControl {
+	return &LoopControl{
+		Interrupt: make(chan struct{}),
+		Abort:     make(chan struct{}),
+		Resume:    make(chan struct{}),
+	}
 }
 
 // LoopConfig configures the agentic loop.
@@ -63,6 +113,11 @@ type LoopConfig struct {
 	// Architect/editor two-phase loop
 	ArchitectEditor ArchitectEditorConfig
 
+	// PermissionRules overrides the default tool permission rules.
+	// When nil, DefaultPermissionRules() is used.
+	// These rules are consulted when GuardedTools is nil.
+	PermissionRules []tool.PermissionRule
+
 	// Approval gates: called before executing ask-permission tools.
 	// nil = allow all (backward-compatible).
 	PermissionCallback PermissionCallback
@@ -71,11 +126,73 @@ type LoopConfig struct {
 	// nil = no audit logging.
 	AuditLogger audit.Logger
 
+	// Checkpoint recorder: records events and file snapshots for time-travel.
+	// nil = no checkpointing.
+	Checkpoint *checkpoint.Recorder
+
+	// MicroagentLoader loads context-injecting microagents.
+	// When set, matched microagents are prepended to the system prompt before the first turn.
+	// nil = no microagent injection.
+	MicroagentLoader *microagent.Loader
+
+	// Hooks runner for lifecycle events (nil = disabled).
+	Hooks *hooks.Runner
+
+	// RiskScorer scores tool calls before execution.
+	// nil = use risk.NoopScorer (backward compat).
+	RiskScorer risk.RiskScorer
+
+	// SessionID is propagated to audit entries.
+	SessionID string
+
+	// SuspendCh, when non-nil, receives a SuspendSignal when the loop suspends
+	// (e.g. consecutive timeouts). The caller should persist state and then send
+	// human input via ResumeCh to continue execution.
+	SuspendCh chan<- SuspendSignal
+
+	// ResumeCh receives the human guidance string that lets the loop continue
+	// after a suspension. Only consulted when SuspendCh is non-nil.
+	ResumeCh <-chan string
+
+	// SteerCh, when non-nil, allows mid-task real-time steering.
+	// Between tool-call batches the loop drains SteerCh and injects any
+	// pending messages as user turns, changing the agent's direction without
+	// restarting the session. Messages are injected non-blocking.
+	SteerCh <-chan string
+
+	// Control, when non-nil, provides granular interrupt/abort/resume signalling.
+	// Interrupt: loop pauses cleanly after the current tool batch completes.
+	// Abort: loop stops immediately (context cancelled).
+	// Resume: loop continues after a pause.
+	Control *LoopControl
+
+	// InlineSummary enables extraction of <summary>...</summary> blocks from
+	// model responses. When true, the summary tag is stripped from the visible
+	// response and delivered via OnTurnSummary. Use when no dedicated
+	// SummaryProvider is configured.
+	InlineSummary bool
+
+	// PhaseBudgets sets per-phase token, turn, and model overrides.
+	// When CurrentPhase is set, the matching budget overrides MaxTokens/MaxTurns/Model.
+	PhaseBudgets map[Phase]PhaseBudget
+
+	// CurrentPhase, when set, activates the corresponding PhaseBudget overrides.
+	// Emitted via EventStream as EventTurnStart.Kind annotations.
+	CurrentPhase Phase
+
+	// EventStream receives typed loop events (tool calls, LLM turns, approvals, errors).
+	// nil = no event streaming. Subscribers call EventStream.Subscribe() before Run().
+	EventStream *EventStream
+
 	// Callbacks
-	OnText       func(text string)
-	OnTextDelta  func(delta string)
-	OnToolCall   func(call provider.ToolCall)
-	OnToolResult func(id, name, result string, isError bool)
+	OnText        func(text string)
+	OnTextDelta   func(delta string)
+	OnToolCall    func(call provider.ToolCall)
+	OnToolResult  func(id, name, result string, isError bool)
+	OnTurnSummary func(turnIdx int, summary string) // called when inline summary extracted
+	// OnRetry is called before each provider retry so the caller can surface
+	// status to the user. attempt is 1-based. delay is the wait before retry.
+	OnRetry func(err error, attempt int, delay time.Duration)
 }
 
 // LoopResult is the outcome of a loop execution.
@@ -95,10 +212,106 @@ type Loop struct {
 	conv                *Conversation
 	stuck               *StuckDetector
 	consecutiveTimeouts int
+	providerRetries     int
+}
+
+// Conv returns the conversation managed by this loop. Used by callers that need
+// to apply turn marks or inspect conversation state after execution.
+func (l *Loop) Conv() *Conversation { return l.conv }
+
+// checkInterrupt checks if the Interrupt or Abort signals are pending.
+// If Interrupt is pending, it waits for Resume or ctx cancellation, then returns false.
+// If Abort is pending, it returns true (caller should stop).
+// Returns true if the loop should stop.
+func (l *Loop) checkInterrupt(ctx context.Context) bool {
+	ctrl := l.cfg.Control
+	if ctrl == nil {
+		return false
+	}
+
+	// Non-blocking check for Abort first (highest priority).
+	select {
+	case <-ctrl.Abort:
+		slog.Info("loop: abort signal received", "agent", l.cfg.Model)
+		return true
+	default:
+	}
+
+	// Non-blocking check for Interrupt.
+	select {
+	case <-ctrl.Interrupt:
+		slog.Info("loop: interrupt signal received — pausing", "agent", l.cfg.Model)
+		if l.cfg.EventStream != nil {
+			l.cfg.EventStream.Emit(StreamEvent{
+				Kind:      EventError,
+				AgentName: l.cfg.Model,
+				SessionID: l.cfg.SessionID,
+				Message:   "paused: waiting for resume",
+			})
+		}
+		// Wait for Resume or ctx cancellation.
+		select {
+		case <-ctrl.Resume:
+			slog.Info("loop: resumed", "agent", l.cfg.Model)
+			return false
+		case <-ctrl.Abort:
+			slog.Info("loop: aborted while paused", "agent", l.cfg.Model)
+			return true
+		case <-ctx.Done():
+			return true
+		}
+	default:
+		return false
+	}
+}
+
+// drainSteer drains all pending messages from SteerCh and injects each as a
+// user turn in the conversation. This is called between tool-call batches so
+// the user can redirect the agent without restarting.
+func (l *Loop) drainSteer() {
+	if l.cfg.SteerCh == nil {
+		return
+	}
+	for {
+		select {
+		case msg, ok := <-l.cfg.SteerCh:
+			if !ok {
+				return
+			}
+			if msg != "" {
+				l.conv.AddUser(msg)
+				slog.Info("loop: steering message injected", "agent", l.cfg.Model)
+				if l.cfg.EventStream != nil {
+					l.cfg.EventStream.Emit(StreamEvent{
+						Kind:      EventTurnStart,
+						AgentName: l.cfg.Model,
+						SessionID: l.cfg.SessionID,
+						Message:   "[steering] " + msg,
+					})
+				}
+			}
+		default:
+			return
+		}
+	}
 }
 
 // NewLoop creates a new agentic loop.
 func NewLoop(cfg LoopConfig) *Loop {
+	// Apply phase budget overrides if a current phase is set.
+	if cfg.CurrentPhase != "" && len(cfg.PhaseBudgets) > 0 {
+		if budget, ok := cfg.PhaseBudgets[cfg.CurrentPhase]; ok {
+			if budget.MaxTokens > 0 {
+				cfg.MaxTokens = budget.MaxTokens
+			}
+			if budget.MaxTurns > 0 {
+				cfg.MaxTurns = budget.MaxTurns
+			}
+			if budget.Model != "" {
+				cfg.Model = budget.Model
+			}
+		}
+	}
 	if cfg.MaxTurns <= 0 {
 		cfg.MaxTurns = defaultMaxTurns
 	}
@@ -138,7 +351,38 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 		defer cancel()
 	}
 
+	slog.Debug("agent_loop_start",
+		"session", l.cfg.SessionID,
+		"model", l.cfg.Model,
+		"max_turns", l.cfg.MaxTurns,
+		"max_tokens", l.cfg.MaxTokens,
+		"prompt_len", len(userPrompt),
+	)
+
 	l.conv.AddUser(userPrompt)
+
+	// Record initial user message for checkpoint.
+	if l.cfg.Checkpoint != nil {
+		if err := l.cfg.Checkpoint.RecordMessage(checkpoint.EventUserMessage, userPrompt); err != nil {
+			slog.Warn("checkpoint: failed to record user message", "session", l.cfg.SessionID, "err", err)
+		}
+	}
+
+	// Fire on_agent_start hook.
+	l.cfg.Hooks.RunOnAgentStart(l.cfg.System, userPrompt)
+
+	// Inject matched microagents into the system prompt.
+	system := l.cfg.System
+	if l.cfg.MicroagentLoader != nil {
+		agents, _ := l.cfg.MicroagentLoader.LoadAll()
+		if len(agents) > 0 {
+			evalCtx := microagent.EvalContext{UserMessage: userPrompt}
+			matches := microagent.Match(agents, evalCtx)
+			if injection := microagent.Inject(matches, 5); injection != "" {
+				system = system + "\n\n" + injection
+			}
+		}
+	}
 
 	var totalTokens provider.TokenUsage
 	turnCount := 0
@@ -174,7 +418,7 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 
 		chatReq := provider.ChatRequest{
 			Model:     l.cfg.Model,
-			System:    l.cfg.System,
+			System:    system,
 			Messages:  messages,
 			Tools:     toolDefs,
 			MaxTokens: l.cfg.MaxTokens,
@@ -183,20 +427,125 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 		var resp *provider.ChatResponse
 		var err error
 
-		// Use streaming when available and delta callback is set
-		if sp, ok := l.cfg.Provider.(provider.StreamProvider); ok && l.cfg.OnTextDelta != nil {
-			resp, err = sp.ChatStream(ctx, chatReq, func(event provider.StreamEvent) {
-				if event.Type == "text_delta" && l.cfg.OnTextDelta != nil {
-					l.cfg.OnTextDelta(event.TextDelta)
-				}
+		slog.Debug("llm_request",
+			"session", l.cfg.SessionID,
+			"model", l.cfg.Model,
+			"turn", turnCount,
+			"messages", len(messages),
+			"tools", len(toolDefs),
+		)
+
+		// Fire before_model_call hook.
+		l.cfg.Hooks.RunBeforeModelCall(l.cfg.System, l.cfg.Model, turnCount)
+
+		// Use streaming when available and delta callback or EventStream is configured.
+		// usedStreaming is set to true when content was already delivered via
+		// OnTextDelta so we skip the redundant OnText call after the response.
+		var usedStreaming bool
+		if sp, ok := l.cfg.Provider.(provider.StreamProvider); ok && (l.cfg.OnTextDelta != nil || l.cfg.EventStream != nil) {
+			usedStreaming = true
+			// When InlineSummary is active, wrap the delta callback in a proxy
+			// that suppresses <summary>…</summary> blocks mid-stream so they
+			// never reach the UI.
+			var proxy *summaryDeltaProxy
+			if l.cfg.InlineSummary && l.cfg.OnTextDelta != nil {
+				proxy = newSummaryDeltaProxy(l.cfg.OnTextDelta)
+			}
+
+			resp, err = traceChat(ctx, l.cfg.Model, func(ctx context.Context) (*provider.ChatResponse, error) {
+				return sp.ChatStream(ctx, chatReq, func(event provider.StreamEvent) {
+					if event.Type == "text_delta" {
+						if proxy != nil {
+							proxy.Write(event.TextDelta)
+						} else if l.cfg.OnTextDelta != nil {
+							l.cfg.OnTextDelta(event.TextDelta)
+						}
+						if l.cfg.EventStream != nil {
+							l.cfg.EventStream.Emit(StreamEvent{
+								Kind:      EventTurnStart,
+								AgentName: l.cfg.Model,
+								SessionID: l.cfg.SessionID,
+								Message:   event.TextDelta,
+							})
+						}
+					}
+				})
 			})
+			if proxy != nil {
+				proxy.Flush()
+			}
 		} else {
-			resp, err = l.cfg.Provider.Chat(ctx, chatReq)
+			resp, err = traceChat(ctx, l.cfg.Model, func(ctx context.Context) (*provider.ChatResponse, error) {
+				return l.cfg.Provider.Chat(ctx, chatReq)
+			})
 		}
 		if err != nil {
+			slog.Debug("llm_error",
+				"session", l.cfg.SessionID,
+				"model", l.cfg.Model,
+				"turn", turnCount,
+				"err", err,
+			)
+			// Retry retriable provider errors (rate limit, overload, server errors)
+			// using exponential backoff with the server's Retry-After hint.
+			if retriable, retryAfter := provider.IsRetriableErr(err); retriable {
+				const maxProviderRetries = 5
+				if l.providerRetries < maxProviderRetries {
+					delay := provider.ExponentialBackoffWithHint(
+						l.providerRetries, 2*time.Second, 60*time.Second, retryAfter,
+					)
+					l.providerRetries++
+					slog.Info("provider error — retrying",
+						"err", err, "attempt", l.providerRetries,
+						"delay", delay, "retryAfter", retryAfter)
+					if l.cfg.OnRetry != nil {
+						l.cfg.OnRetry(err, l.providerRetries, delay)
+					}
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(delay):
+					}
+					continue
+				}
+			}
+			l.providerRetries = 0
+
 			if errors.Is(err, context.DeadlineExceeded) && l.cfg.MaxConsecutiveTimeouts > 0 {
 				l.consecutiveTimeouts++
 				if l.consecutiveTimeouts >= l.cfg.MaxConsecutiveTimeouts {
+					// Suspend if a channel is wired; otherwise abort.
+					if l.cfg.SuspendCh != nil && l.cfg.ResumeCh != nil {
+						cpID := ""
+						if l.cfg.Checkpoint != nil {
+							_ = l.cfg.Checkpoint.RecordSuspend(checkpoint.SuspendReasonError)
+							cpID, _ = l.cfg.Checkpoint.CreateCheckpoint("auto-suspend", nil)
+						}
+						sig := SuspendSignal{
+							CheckpointID: cpID,
+							Reason:       checkpoint.SuspendReasonError,
+							Preview:      fmt.Sprintf("Stuck after %d consecutive timeouts. Provide guidance to continue.", l.cfg.MaxConsecutiveTimeouts),
+						}
+						select {
+						case l.cfg.SuspendCh <- sig:
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						}
+						select {
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						case humanInput, ok := <-l.cfg.ResumeCh:
+							if !ok {
+								return nil, fmt.Errorf("resume channel closed during suspend")
+							}
+							if l.cfg.Checkpoint != nil {
+								_ = l.cfg.Checkpoint.RecordResume(humanInput)
+							}
+							l.conv.AddUser("[Human guidance]: " + humanInput)
+							l.consecutiveTimeouts = 0
+							continue
+						}
+					}
 					return nil, fmt.Errorf("chat turn %d: %d consecutive timeouts — aborting: %w",
 						turnCount, l.consecutiveTimeouts, err)
 				}
@@ -206,6 +555,21 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 			return nil, fmt.Errorf("chat turn %d: %w", turnCount, err)
 		}
 		l.consecutiveTimeouts = 0
+		l.providerRetries = 0
+
+		slog.Debug("llm_response",
+			"session", l.cfg.SessionID,
+			"model", l.cfg.Model,
+			"turn", turnCount,
+			"stop_reason", resp.StopReason,
+			"tool_calls", len(resp.Message.ToolCalls),
+			"prompt_tokens", resp.TokensUsed.PromptTokens,
+			"completion_tokens", resp.TokensUsed.CompletionTokens,
+			"cache_read_tokens", resp.TokensUsed.CacheReadTokens,
+		)
+
+		// Fire after_model_call hook.
+		l.cfg.Hooks.RunAfterModelCall(l.cfg.System, l.cfg.Model, turnCount, resp.TokensUsed.TotalTokens)
 
 		totalTokens.PromptTokens += resp.TokensUsed.PromptTokens
 		totalTokens.CompletionTokens += resp.TokensUsed.CompletionTokens
@@ -213,12 +577,39 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 		totalTokens.CacheReadTokens += resp.TokensUsed.CacheReadTokens
 		totalTokens.CacheWriteTokens += resp.TokensUsed.CacheWriteTokens
 
+		// Extract inline summary before displaying content to the user.
+		if l.cfg.InlineSummary && resp.Message.Content != "" {
+			if summaryText, cleaned := ExtractInlineSummary(resp.Message.Content); summaryText != "" {
+				resp.Message.Content = cleaned
+				if l.cfg.OnTurnSummary != nil {
+					l.cfg.OnTurnSummary(turnCount-1, summaryText)
+				}
+			}
+		}
+
 		// Add assistant message to history
 		l.conv.AddAssistant(resp.Message)
 
-		// Fire text callback for any text content
-		if resp.Message.Content != "" && l.cfg.OnText != nil {
+		// Fire text callback for any text content — skip if streaming already
+		// delivered the content delta-by-delta via OnTextDelta.
+		if resp.Message.Content != "" && l.cfg.OnText != nil && !usedStreaming {
 			l.cfg.OnText(resp.Message.Content)
+		}
+		if resp.Message.Content != "" && l.cfg.EventStream != nil {
+			l.cfg.EventStream.Emit(StreamEvent{
+				Kind:      EventTurnEnd,
+				AgentName: l.cfg.Model,
+				SessionID: l.cfg.SessionID,
+				Message:   resp.Message.Content,
+				Step:      turnCount,
+			})
+		}
+
+		// Record assistant message for checkpoint.
+		if l.cfg.Checkpoint != nil && resp.Message.Content != "" {
+			if err := l.cfg.Checkpoint.RecordMessage(checkpoint.EventAssistant, resp.Message.Content); err != nil {
+				slog.Warn("checkpoint: failed to record assistant message", "session", l.cfg.SessionID, "err", err)
+			}
 		}
 
 		// No tool calls → agent is done; run reflection before returning
@@ -240,9 +631,22 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 					if reflectionRetries < l.cfg.Reflector.MaxRetries() {
 						reflectionRetries++
 						metrics.ReflectionCount++
+						slog.Debug("reflection_retry",
+							"session", l.cfg.SessionID,
+							"model", l.cfg.Model,
+							"turn", turnCount,
+							"failed_phase", failedPhase,
+							"retry", reflectionRetries,
+						)
 						l.conv.AddUser(feedback)
 						continue // feed error back for a new iteration
 					}
+					slog.Warn("reflection_failed",
+						"session", l.cfg.SessionID,
+						"model", l.cfg.Model,
+						"failed_phase", failedPhase,
+						"retries_exhausted", reflectionRetries,
+					)
 				}
 			}
 
@@ -252,6 +656,8 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 			metrics.CostUSD = provider.ComputeCostUSD(totalTokens, l.cfg.Model)
 			metrics.computePressure(l.cfg.MaxTokens)
 			slog.Info("agent_loop_completed",
+				"session", l.cfg.SessionID,
+				"model", l.cfg.Model,
 				"turns", turnCount,
 				"prompt_tokens", totalTokens.PromptTokens,
 				"completion_tokens", totalTokens.CompletionTokens,
@@ -260,8 +666,16 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 				"cost_usd", metrics.CostUSD,
 				"duration_ms", metrics.Duration.Milliseconds(),
 				"context_pressure", metrics.ContextWindowPressure,
-				"model", l.cfg.Model,
 			)
+			l.cfg.Hooks.RunOnAgentDone(l.cfg.System, turnCount, "")
+			if l.cfg.EventStream != nil {
+				l.cfg.EventStream.Emit(StreamEvent{
+					Kind:      EventDone,
+					AgentName: l.cfg.Model,
+					SessionID: l.cfg.SessionID,
+					Step:      turnCount,
+				})
+			}
 			return &LoopResult{
 				FinalText:         resp.Message.Content,
 				TurnCount:         turnCount,
@@ -276,9 +690,37 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 		for _, tc := range resp.Message.ToolCalls {
 			metrics.recordToolCall(tc.Name)
 
+			slog.Debug("tool_call",
+				"session", l.cfg.SessionID,
+				"model", l.cfg.Model,
+				"turn", turnCount,
+				"tool", tc.Name,
+				"input", string(tc.Input),
+			)
+
 			if l.cfg.OnToolCall != nil {
 				l.cfg.OnToolCall(tc)
 			}
+			if l.cfg.EventStream != nil {
+				l.cfg.EventStream.Emit(StreamEvent{
+					Kind:      EventToolCall,
+					AgentName: l.cfg.Model,
+					SessionID: l.cfg.SessionID,
+					ToolName:  tc.Name,
+					ToolInput: string(tc.Input),
+					Step:      turnCount,
+				})
+			}
+
+			// Record tool call event for checkpoint time-travel.
+			if l.cfg.Checkpoint != nil {
+				if err := l.cfg.Checkpoint.RecordToolCall(tc.Name, tc.Input); err != nil {
+					slog.Warn("checkpoint: failed to record tool call", "tool", tc.Name, "err", err)
+				}
+			}
+
+			// Fire before_tool_call hook.
+			l.cfg.Hooks.RunBeforeToolCall(l.cfg.System, tc.Name, tc.Input)
 
 			result := l.executeTool(ctx, tc)
 
@@ -295,6 +737,41 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 
 			l.conv.AddToolResult(tc.ID, result.Content, result.IsError)
 
+			if result.IsError {
+				slog.Debug("tool_error",
+					"session", l.cfg.SessionID,
+					"model", l.cfg.Model,
+					"turn", turnCount,
+					"tool", tc.Name,
+					"result", result.Content,
+				)
+			} else {
+				slog.Debug("tool_result",
+					"session", l.cfg.SessionID,
+					"model", l.cfg.Model,
+					"turn", turnCount,
+					"tool", tc.Name,
+					"result_len", len(result.Content),
+				)
+			}
+
+			// Record tool result and file-modified events.
+			if l.cfg.Checkpoint != nil {
+				if err := l.cfg.Checkpoint.RecordToolResult(tc.Name, result.Content, result.IsError); err != nil {
+					slog.Warn("checkpoint: failed to record tool result", "tool", tc.Name, "err", err)
+				}
+				if !result.IsError && isFileMutatingTool(tc.Name) {
+					if path := extractPathArg(tc.Input); path != "" {
+						if err := l.cfg.Checkpoint.RecordFileModified(path); err != nil {
+							slog.Warn("checkpoint: failed to record file modified", "path", path, "err", err)
+						}
+					}
+				}
+			}
+
+			// Fire after_tool_call hook.
+			l.cfg.Hooks.RunAfterToolCall(l.cfg.System, tc.Name, tc.Input, result.Content, result.IsError)
+
 			// Track for stuck detection
 			inputStr := ""
 			if tc.Input != nil {
@@ -305,10 +782,40 @@ func (l *Loop) runSinglePhaseWithPrompt(ctx context.Context, userPrompt string) 
 			if l.cfg.OnToolResult != nil {
 				l.cfg.OnToolResult(tc.ID, tc.Name, result.Content, result.IsError)
 			}
+			if l.cfg.EventStream != nil {
+				l.cfg.EventStream.Emit(StreamEvent{
+					Kind:       EventToolResult,
+					AgentName:  l.cfg.Model,
+					SessionID:  l.cfg.SessionID,
+					ToolName:   tc.Name,
+					ToolOutput: result.Content,
+					Step:       turnCount,
+				})
+			}
+		}
+
+		// Real-time steering: inject any pending user guidance before next LLM call.
+		l.drainSteer()
+
+		// Granular interrupt: pause cleanly if Interrupt fired, wait for Resume.
+		if l.cfg.Control != nil {
+			if interrupted := l.checkInterrupt(ctx); interrupted {
+				return &LoopResult{
+					TurnCount:  turnCount,
+					TokensUsed: totalTokens,
+					Metrics:    metrics,
+				}, fmt.Errorf("loop interrupted")
+			}
 		}
 
 		// Check stuck after processing all tool calls in this turn
 		if pattern, stuck := l.stuck.CheckAll(); stuck {
+			slog.Warn("agent_stuck",
+				"session", l.cfg.SessionID,
+				"model", l.cfg.Model,
+				"turn", turnCount,
+				"pattern", pattern,
+			)
 			metrics.StuckCount++
 			stuckErr := fmt.Errorf("agent stuck: same tool+input repeated %d times in last %d calls — aborting",
 				l.cfg.StuckThreshold, l.cfg.StuckWindowSize)
@@ -535,12 +1042,16 @@ func (l *Loop) executeTool(ctx context.Context, tc provider.ToolCall) *tool.Resu
 		return result
 	}
 
-	// Resolve permission level: use GuardedTools if available, else default rules.
+	// Resolve permission level: use GuardedTools if available, else rules from config or defaults.
 	var permLevel tool.PermissionLevel
 	if l.cfg.GuardedTools != nil {
 		permLevel = l.cfg.GuardedTools.CheckLevel(tc.Name)
 	} else {
-		checker := tool.NewPermissionChecker(tool.DefaultPermissionRules())
+		rules := l.cfg.PermissionRules
+		if len(rules) == 0 {
+			rules = tool.DefaultPermissionRules()
+		}
+		checker := tool.NewPermissionChecker(rules)
 		permLevel = checker.Check(tc.Name)
 	}
 
@@ -589,4 +1100,33 @@ func (l *Loop) executeTool(ctx context.Context, tc provider.ToolCall) *tool.Resu
 		return auditLog(tool.ErrorResult(fmt.Sprintf("tool error: %v", err)))
 	}
 	return auditLog(result)
+}
+
+// isFileMutatingTool returns true for tools that modify files on disk.
+func isFileMutatingTool(name string) bool {
+	switch name {
+	case "write", "edit", "patch", "undo_edit":
+		return true
+	}
+	return false
+}
+
+// extractPathArg extracts the "path" field from a JSON tool input, if present.
+func extractPathArg(input json.RawMessage) string {
+	if input == nil {
+		return ""
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(input, &m); err != nil {
+		return ""
+	}
+	raw, ok := m["path"]
+	if !ok {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return ""
+	}
+	return s
 }

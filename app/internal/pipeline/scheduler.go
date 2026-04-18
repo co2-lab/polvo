@@ -29,6 +29,23 @@ type Scheduler struct {
 	maxRetries int
 	logger     *slog.Logger
 	pub        EventPublisher // may be nil
+	supervisor *Supervisor    // nil = use DefaultChain only
+}
+
+// WithSupervisor registers a supervisor on the scheduler (nil-safe).
+func (s *Scheduler) WithSupervisor(sup *Supervisor) *Scheduler {
+	s.supervisor = sup
+	return s
+}
+
+// lookupStep finds a step by agent name.
+func (s *Scheduler) lookupStep(agentName string) (*Step, bool) {
+	for i := range s.chain {
+		if s.chain[i].Agent == agentName {
+			return &s.chain[i], true
+		}
+	}
+	return nil, false
 }
 
 // NewScheduler creates a new pipeline scheduler.
@@ -63,7 +80,21 @@ func (s *Scheduler) UpdateDeps(executor *agent.Executor, cfg *config.Config) {
 func (s *Scheduler) HandleEvent(ctx context.Context, event *FileEvent) error {
 	s.logger.Info("handling event", "type", event.Type, "file", event.File)
 
-	// Find matching step
+	// Supervisor routing (opt-in): try dynamic routing before DefaultChain.
+	if s.supervisor != nil {
+		if decision, err := s.supervisor.Route(ctx, event); err == nil && !decision.Fallthrough {
+			if step, ok := s.lookupStep(decision.Agent); ok {
+				s.logger.Info("supervisor routing",
+					"agent", decision.Agent,
+					"confidence", decision.Confidence,
+					"rationale", decision.Rationale,
+				)
+				return s.executeStep(ctx, step, event)
+			}
+		}
+	}
+
+	// DefaultChain matching (original behaviour).
 	var step *Step
 	for i := range s.chain {
 		if s.chain[i].Trigger == event.Type {

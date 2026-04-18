@@ -9,16 +9,11 @@ import { getPanelIcon } from '../icons/panelIcon'
 import { getKind } from '../../store/useIDEStore'
 import { getFileIconUrl } from '../../lib/fileIcons'
 import { getIconColor } from '../../lib/fileIconColor'
+import { getBaseTitle, computeTitleIndices, resolveTitle } from '../../lib/titleUtils'
 
 function collectPanels(node: LayoutNode): PanelNode[] {
   if (node.type === 'panel') return [node]
   return node.children.flatMap(collectPanels)
-}
-
-function panelLabel(contentId: string, dockItems: ReturnType<typeof useIDEStore.getState>['dockItems']): string {
-  if (contentId.startsWith('file:')) return contentId.slice(5).split('/').pop() ?? contentId.slice(5)
-  if (contentId.startsWith('newfile:')) return `Untitled-${contentId.slice(8)}`
-  return dockItems.find(i => i.id === contentId)?.name ?? contentId
 }
 
 async function pickDirectory(): Promise<string | null> {
@@ -250,12 +245,13 @@ function FileTabItem({ tabId, panelId, isActive, label }: {
   )
 }
 
-function PanelRow({ panel, projectColor, isGrouped, isOpen, onToggle }: {
+function PanelRow({ panel, projectColor, isGrouped, isOpen, onToggle, titleIndices }: {
   panel: PanelNode
   projectColor: string | null
   isGrouped: boolean
   isOpen: boolean
   onToggle: () => void
+  titleIndices: Map<string, number | null>
 }) {
   const t = useT()
   const { removePanel, focusPanel, dockItems } = useIDEStore()
@@ -263,7 +259,7 @@ function PanelRow({ panel, projectColor, isGrouped, isOpen, onToggle }: {
   const dockItem = dockItems.find(i => i.id === panel.contentId)
   const label = isGrouped
     ? (kind === 'editor' ? t('panel.editor') : dockItem?.name ?? kind)
-    : panelLabel(panel.contentId, dockItems)
+    : resolveTitle(getBaseTitle(panel.contentId, dockItems), panel.id, titleIndices)
   const color = projectColor
 
   return (
@@ -319,8 +315,10 @@ function PanelRow({ panel, projectColor, isGrouped, isOpen, onToggle }: {
 
 function PanelsTab() {
   const t = useT()
-  const { workspaces, activeWorkspaceId, projects, activeProjectId } = useIDEStore()
+  const { workspaces, activeWorkspaceId, projects, activeProjectId, dockItems } = useIDEStore()
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+
+  const titleIndices = computeTitleIndices(workspaces, dockItems)
 
   const toggle = (id: string) => setCollapsed(prev => {
     const next = new Set(prev)
@@ -372,6 +370,7 @@ function PanelsTab() {
                         isGrouped={isGrouped}
                         isOpen={isOpen}
                         onToggle={() => toggle(panel.id)}
+                        titleIndices={titleIndices}
                       />
                       {isGrouped && isOpen && (
                         <div className="ml-5 border-l border-white/5 pl-2 flex flex-col gap-0.5 mb-0.5">
@@ -381,7 +380,7 @@ function PanelsTab() {
                               tabId={tabId}
                               panelId={panel.id}
                               isActive={tabId === panel.contentId}
-                              label={panelLabel(tabId, useIDEStore.getState().dockItems)}
+                              label={resolveTitle(getBaseTitle(panel.tabContentIds?.[tabId] ?? tabId, dockItems), `${panel.id}:${tabId}`, titleIndices)}
                             />
                           ))}
                         </div>

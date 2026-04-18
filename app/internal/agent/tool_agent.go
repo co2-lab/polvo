@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/co2-lab/polvo/internal/agent/microagent"
+	"github.com/co2-lab/polvo/internal/hooks"
 	"github.com/co2-lab/polvo/internal/provider"
 	"github.com/co2-lab/polvo/internal/template"
 	"github.com/co2-lab/polvo/internal/tool"
@@ -18,8 +20,11 @@ type ToolLLMAgent struct {
 	promptTmpl      string
 	providerInst    provider.ChatProvider
 	model           string
-	tools           *tool.Registry
-	architectEditor ArchitectEditorConfig
+	tools            *tool.Registry
+	architectEditor  ArchitectEditorConfig
+	permissionRules  []tool.PermissionRule  // nil = use DefaultPermissionRules
+	microagentLoader *microagent.Loader     // nil = no microagent injection
+	hooksRunner      *hooks.Runner          // nil = no hooks
 }
 
 // NewToolLLMAgent creates an agent that uses tools during execution.
@@ -84,13 +89,16 @@ func (a *ToolLLMAgent) Execute(ctx context.Context, input *Input) (*Result, erro
 	}
 
 	loop := NewLoop(LoopConfig{
-		Provider:        a.providerInst,
-		Tools:           loopTools,
-		System:          "You are the " + a.name + " agent for Polvo, an AI agent orchestrator.",
-		Model:           a.model,
-		MaxTurns:        20,
-		MaxTokens:       8192,
-		ArchitectEditor: a.architectEditor,
+		Provider:         a.providerInst,
+		Tools:            loopTools,
+		System:           "You are the " + a.name + " agent for Polvo, an AI agent orchestrator.",
+		Model:            a.model,
+		MaxTurns:         20,
+		MaxTokens:        8192,
+		ArchitectEditor:  a.architectEditor,
+		PermissionRules:  a.permissionRules,
+		MicroagentLoader: a.microagentLoader,
+		Hooks:            a.hooksRunner,
 	})
 
 	result, err := loop.Run(ctx, prompt)

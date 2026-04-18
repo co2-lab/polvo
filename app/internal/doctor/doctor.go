@@ -26,12 +26,14 @@ type Diagnosis struct {
 
 // Input holds everything the doctor needs to run checks.
 type Input struct {
-	Cfg       *config.Config
-	Registry  *provider.Registry
-	Resolver  *guide.Resolver
-	Watching  bool
-	StateOK   bool // true if state file loaded successfully
-	StateFile string
+	Cfg        *config.Config
+	Registry   *provider.Registry
+	Resolver   *guide.Resolver
+	Watching   bool
+	StateOK    bool // true if state file loaded successfully
+	StateFile  string
+	ChunkIndex interface{ Count() (int, error) }        // nil = check skipped
+	Indexer    interface{ IndexAll(context.Context) error } // nil = fix not available
 }
 
 // Run executes all checks and returns the results.
@@ -53,6 +55,7 @@ func Run(in Input) []Diagnosis {
 	diags = append(diags, checkStateFile(in.StateOK, in.StateFile))
 	diags = append(diags, checkWatchState(in.Watching, in.StateFile))
 	diags = append(diags, checkGuidesDir())
+	diags = append(diags, checkChunkIndex(in.ChunkIndex, in.Indexer))
 
 	return diags
 }
@@ -232,6 +235,37 @@ func checkWatchState(watching bool, stateFile string) Diagnosis {
 		return d
 	}
 	d.OK = true
+	return d
+}
+
+func checkChunkIndex(idx interface{ Count() (int, error) }, ix interface{ IndexAll(context.Context) error }) Diagnosis {
+	d := Diagnosis{Category: "index", Label: "chunk index populated"}
+	if idx == nil {
+		d.OK = true
+		d.Detail = "indexer not configured"
+		return d
+	}
+	n, err := idx.Count()
+	if err != nil {
+		d.Detail = fmt.Sprintf("error querying index: %v", err)
+		d.Fix = "Check .polvo/memory.db permissions"
+		return d
+	}
+	if n == 0 {
+		d.Detail = "chunk index is empty — search_code tool has no data"
+		d.Fix = "Run full reindex"
+		if ix != nil {
+			d.Fixable = true
+			d.FixFn = func() error {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				defer cancel()
+				return ix.IndexAll(ctx)
+			}
+		}
+		return d
+	}
+	d.OK = true
+	d.Detail = fmt.Sprintf("%d chunks indexed", n)
 	return d
 }
 

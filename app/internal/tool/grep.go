@@ -118,9 +118,9 @@ func (t *grepTool) Execute(_ context.Context, input json.RawMessage) (*Result, e
 	} else {
 		if len(results) > maxResults {
 			results = results[:maxResults]
-			results = append(results, fmt.Sprintf("... (truncated at %d results)", maxResults))
 		}
-		res = &Result{Content: strings.Join(results, "\n")}
+		output := TruncateObservation(strings.Join(results, "\n"), DefaultMaxObservationChars)
+		res = &Result{Content: output}
 	}
 	if t.cache != nil {
 		key := CacheKey(t.Name(), input, "")

@@ -15,6 +15,15 @@ type OrchestratorConfig struct {
 	BranchPerRun   bool
 	BranchTemplate string // default: "polvo/{{agent}}/{{timestamp}}"
 	Attribution    string // default: "(polvo)"
+
+	// Remote / PR fields (Plan 46)
+	PushAfterCommit bool      // push to RemoteName after AutoCommit
+	PROnCompletion  bool      // open PR after push
+	PRDraft         bool      // draft PR (conservative default)
+	PRBase          string    // base branch for PR (default "main")
+	PRTitleTemplate string    // "{{agent}}: {{task_short}}"
+	RemoteName      string    // default "origin"
+	PRCreator       PRCreator // nil = PR disabled
 }
 
 // Orchestrator wraps pre/post run git operations.
@@ -74,7 +83,9 @@ func (o *Orchestrator) PreRun(ctx context.Context, agentName string) error {
 
 // PostRun runs after a successful agent execution:
 // 1. If AutoCommit: stage modified files + commit with generated message.
-// Errors are non-fatal.
+// 2. If PushAfterCommit: conflict check + push.
+// 3. If PROnCompletion: check for existing PR or create a new one.
+// All steps are non-fatal (errors logged at WARN).
 func (o *Orchestrator) PostRun(ctx context.Context, agentName string, modifiedFiles []string) error {
 	if !o.cfg.AutoCommit {
 		return nil
@@ -115,9 +126,116 @@ func (o *Orchestrator) PostRun(ctx context.Context, agentName string, modifiedFi
 		slog.Warn("git_orchestrator: commit failed", "agent", agentName, "err", err)
 		return nil
 	}
-
 	slog.Info("git_orchestrator: committed changes", "agent", agentName, "message", msg)
+
+	if !o.cfg.PushAfterCommit {
+		return nil
+	}
+
+	remote := o.cfg.RemoteName
+	if remote == "" {
+		remote = "origin"
+	}
+
+	// Conflict detection: fetch + check if remote branch has diverged.
+	branch, err := o.client.CurrentBranch(ctx)
+	if err != nil {
+		slog.Warn("git_orchestrator: cannot get current branch", "err", err)
+		return nil
+	}
+	if diverged := o.checkConflict(ctx, remote, branch); diverged {
+		slog.Warn("git_orchestrator: remote branch has diverged — skipping push; run git pull --rebase manually",
+			"remote", remote, "branch", branch)
+		return nil
+	}
+
+	// Try SetUpstream first (first push of new branch); fall back to plain Push.
+	if err := o.client.SetUpstream(ctx, remote, branch); err != nil {
+		if err2 := o.client.Push(ctx, remote, branch, false); err2 != nil {
+			slog.Warn("git_orchestrator: push failed", "agent", agentName, "remote", remote, "branch", branch, "err", err2)
+			return nil
+		}
+	}
+	slog.Info("git_orchestrator: pushed branch", "remote", remote, "branch", branch)
+
+	if !o.cfg.PROnCompletion || o.cfg.PRCreator == nil {
+		return nil
+	}
+
+	// Check for existing PR.
+	existingURL, _ := o.cfg.PRCreator.ExistingPRURL(ctx, branch)
+	if existingURL != "" {
+		slog.Info("git_orchestrator: PR already exists", "url", existingURL)
+		return nil
+	}
+
+	// Resolve owner/repo from remote URL.
+	remoteURL, err := o.client.RemoteURL(ctx, remote)
+	if err != nil {
+		slog.Warn("git_orchestrator: cannot get remote URL", "err", err)
+		return nil
+	}
+	owner, repo := ParseOwnerRepo(remoteURL)
+	if owner == "" || repo == "" {
+		slog.Warn("git_orchestrator: cannot parse owner/repo from remote URL", "url", remoteURL)
+		return nil
+	}
+
+	base := o.cfg.PRBase
+	if base == "" {
+		base = "main"
+	}
+	title := renderPRTitle(o.cfg.PRTitleTemplate, agentName)
+	body := BuildPRBody(agentName, "", modifiedFiles)
+
+	pr, err := o.cfg.PRCreator.CreatePR(ctx, PROptions{
+		Owner: owner,
+		Repo:  repo,
+		Title: title,
+		Body:  body,
+		Head:  branch,
+		Base:  base,
+		Draft: o.cfg.PRDraft,
+	})
+	if err != nil {
+		slog.Warn("git_orchestrator: PR creation failed", "agent", agentName, "err", err)
+		return nil
+	}
+	slog.Info("git_orchestrator: PR created", "url", pr.URL, "draft", pr.Draft)
 	return nil
+}
+
+// checkConflict returns true if the remote branch has diverged from local HEAD.
+// A failure to fetch is treated as no-divergence (conservative: let push fail naturally).
+func (o *Orchestrator) checkConflict(ctx context.Context, remote, branch string) bool {
+	if err := o.client.FetchRemote(ctx, remote); err != nil {
+		slog.Warn("git_orchestrator: fetch failed during conflict check", "err", err)
+		return false
+	}
+	// git merge-base returns the common ancestor; if it equals the remote tip, no divergence.
+	execC, ok := o.client.(*ExecClient)
+	if !ok {
+		return false
+	}
+	remoteBranch := remote + "/" + branch
+	mergeBase, err := execC.run(ctx, "merge-base", "HEAD", remoteBranch)
+	if err != nil {
+		// Remote branch doesn't exist yet — new branch, no conflict.
+		return false
+	}
+	remoteTip, err := execC.run(ctx, "rev-parse", remoteBranch)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(mergeBase) != strings.TrimSpace(remoteTip)
+}
+
+// renderPRTitle substitutes {{agent}} in the title template.
+func renderPRTitle(tmpl, agentName string) string {
+	if tmpl == "" {
+		return fmt.Sprintf("%s: automated changes", agentName)
+	}
+	return strings.ReplaceAll(tmpl, "{{agent}}", agentName)
 }
 
 // commitDirty stages and commits any pre-existing dirty files before the run.

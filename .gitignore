@@ -1,3 +1,5 @@
+.polvo/
+
 # Environment
 .env
 .env.local
@@ -46,3 +48,4 @@ ui/dist/
 *.swp
 *.swo
 *~
+*.symbols

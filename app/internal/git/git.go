@@ -31,6 +31,14 @@ type Client interface {
 	IsCleanWorkingTree(ctx context.Context) (bool, error)
 	IsGitRepo(ctx context.Context) bool
 	RepoRoot(ctx context.Context) (string, error)
+
+	// Remote operations.
+	Push(ctx context.Context, remote, branch string, force bool) error
+	SetUpstream(ctx context.Context, remote, branch string) error
+	FetchRemote(ctx context.Context, remote string) error
+	PullRebase(ctx context.Context, remote, branch string) error
+	RemoteURL(ctx context.Context, remote string) (string, error)
+	ListRemoteBranches(ctx context.Context, remote string) ([]string, error)
 }
 
 // ExecClient implements Client using os/exec.
@@ -157,4 +165,63 @@ func (c *ExecClient) IsGitRepo(ctx context.Context) bool {
 // RepoRoot returns the absolute path of the repository root.
 func (c *ExecClient) RepoRoot(ctx context.Context) (string, error) {
 	return c.run(ctx, "rev-parse", "--show-toplevel")
+}
+
+// Push pushes the given branch to the remote.
+// NOTE: --no-verify is never passed (Polvo policy).
+func (c *ExecClient) Push(ctx context.Context, remote, branch string, force bool) error {
+	args := []string{"push", remote, branch}
+	if force {
+		args = append(args, "--force-with-lease")
+	}
+	_, err := c.run(ctx, args...)
+	return err
+}
+
+// SetUpstream pushes and sets the upstream tracking branch.
+// Use for the first push of a new branch.
+func (c *ExecClient) SetUpstream(ctx context.Context, remote, branch string) error {
+	_, err := c.run(ctx, "push", "--set-upstream", remote, branch)
+	return err
+}
+
+// FetchRemote fetches all refs from the remote.
+func (c *ExecClient) FetchRemote(ctx context.Context, remote string) error {
+	_, err := c.run(ctx, "fetch", remote)
+	return err
+}
+
+// PullRebase fetches and rebases the current branch onto remote/branch.
+func (c *ExecClient) PullRebase(ctx context.Context, remote, branch string) error {
+	_, err := c.run(ctx, "pull", "--rebase", remote, branch)
+	return err
+}
+
+// RemoteURL returns the URL configured for the given remote.
+func (c *ExecClient) RemoteURL(ctx context.Context, remote string) (string, error) {
+	return c.run(ctx, "remote", "get-url", remote)
+}
+
+// ListRemoteBranches returns branch names on the remote (without the "remote/" prefix).
+func (c *ExecClient) ListRemoteBranches(ctx context.Context, remote string) ([]string, error) {
+	out, err := c.run(ctx, "ls-remote", "--heads", remote)
+	if err != nil {
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	var branches []string
+	for _, line := range strings.Split(out, "\n") {
+		// Format: "<sha>\trefs/heads/<branch>"
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		ref := strings.TrimPrefix(parts[1], "refs/heads/")
+		if ref != "" {
+			branches = append(branches, ref)
+		}
+	}
+	return branches, nil
 }

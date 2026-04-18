@@ -29,6 +29,16 @@ type Config struct {
 	Settings    SettingsConfig                  `koanf:"settings"`
 	Permissions PermissionsConfig               `koanf:"permissions"`
 	Hooks       HooksConfig                     `koanf:"hooks"`
+	Telemetry   TelemetryConfig                 `koanf:"telemetry"`
+}
+
+// TelemetryConfig controls error reporting. Enabled by default; users can opt out.
+type TelemetryConfig struct {
+	// Disabled turns off all telemetry. Set in ~/.polvo/config.yaml or polvo.yaml:
+	//   telemetry:
+	//     disabled: true
+	Disabled    bool   `koanf:"disabled"`
+	Environment string `koanf:"environment"` // e.g. "production", "development"
 }
 
 // ProjectConfig holds project metadata.
@@ -233,14 +243,27 @@ type ReviewConfig struct {
 
 // GitConfig holds git settings.
 type GitConfig struct {
-	BranchPrefix   string   `koanf:"branch_prefix"`
-	PRLabels       []string `koanf:"pr_labels"`
-	TargetBranch   string   `koanf:"target_branch"`
-	AutoCommit     bool     `koanf:"auto_commit"`
-	DirtyCommit    bool     `koanf:"dirty_commit"`
-	BranchPerRun   bool     `koanf:"branch_per_run"`
-	BranchTemplate string   `koanf:"branch_template"`
-	Attribution    string   `koanf:"attribution"`
+	BranchPrefix    string   `koanf:"branch_prefix"`
+	PRLabels        []string `koanf:"pr_labels"`
+	TargetBranch    string   `koanf:"target_branch"`
+	AutoCommit      bool     `koanf:"auto_commit"`
+	DirtyCommit     bool     `koanf:"dirty_commit"`
+	BranchPerRun    bool     `koanf:"branch_per_run"`
+	BranchTemplate  string   `koanf:"branch_template"`
+	Attribution     string   `koanf:"attribution"`
+	PushAfterCommit bool     `koanf:"push_after_commit"` // push to remote after auto-commit
+	PROnCompletion  bool     `koanf:"pr_on_completion"`  // open PR after push
+	PRDraft         bool     `koanf:"pr_draft"`          // default true (conservative)
+	PRBase          string   `koanf:"pr_base"`           // default "main"
+	PRTitleTemplate string   `koanf:"pr_title_template"` // "{{agent}}: {{task_short}}"
+	RemoteName      string   `koanf:"remote_name"`       // default "origin"
+}
+
+// AuditConfig holds audit storage settings.
+type AuditConfig struct {
+	Enabled       bool   `koanf:"enabled"`
+	DBPath        string `koanf:"db_path"`        // default ".polvo/audit.db"
+	RetentionDays int    `koanf:"retention_days"` // 0 = no pruning
 }
 
 // WatcherConfig defines a named file watcher.
@@ -286,7 +309,13 @@ type SettingsConfig struct {
 	BashMaxCPUSecs    int                  `koanf:"bash_max_cpu_secs"`    // 0 = disabled
 	BashMaxMemMB      int                  `koanf:"bash_max_mem_mb"`       // 0 = disabled
 	BashMaxFileSizeMB int                  `koanf:"bash_max_file_size_mb"` // 0 = disabled
-	StuckDetection      StuckDetectionConfig `koanf:"stuck_detection"`
+	StuckDetection               StuckDetectionConfig `koanf:"stuck_detection"`
+	SupervisorModel               string  `koanf:"supervisor_model"`
+	SupervisorConfidenceThreshold float64 `koanf:"supervisor_confidence_threshold"`
+	// SummaryModel is a cheap model used for on-demand summarisation (turn marks,
+	// session work items, context fallback). When empty, the main model generates
+	// inline summaries via <summary> tags instead.
+	SummaryModel string `koanf:"summary_model"`
 }
 
 // AgentsConfig holds per-agent overrides.
@@ -296,11 +325,20 @@ type AgentsConfig map[string]AgentRunConfig
 type PermissionsConfig struct {
 	Rules     []PermissionRule `koanf:"rules"`
 	Blocklist []string         `koanf:"blocklist"` // command prefix/exact patterns to block in bash
+	Audit     AuditConfig      `koanf:"audit"`
 }
 
-// HooksConfig configures git hook behavior.
+// HooksConfig configures git hook behavior and agent lifecycle hooks.
 type HooksConfig struct {
 	PreCommit PreCommitHookConfig `koanf:"pre_commit"`
+	// Agent lifecycle hooks — shell commands executed at various agent loop points.
+	// Each command receives JSON on stdin.
+	BeforeToolCall  []string `koanf:"before_tool_call"`
+	AfterToolCall   []string `koanf:"after_tool_call"`
+	BeforeModelCall []string `koanf:"before_model_call"`
+	AfterModelCall  []string `koanf:"after_model_call"`
+	OnAgentStart    []string `koanf:"on_agent_start"`
+	OnAgentDone     []string `koanf:"on_agent_done"`
 }
 
 // PreCommitHookConfig configures the pre-commit hook.
@@ -311,6 +349,11 @@ type PreCommitHookConfig struct {
 	CheckPolvoYAML bool `koanf:"check_polvo_yaml"`
 	// SecretsScan runs regex + entropy scan on the full staged diff (default: true).
 	SecretsScan bool `koanf:"secrets_scan"`
+	// SecretsScanIgnore is a list of path glob patterns (fnmatch-style) that are
+	// excluded from the secrets scan. Useful for test fixtures, generated files,
+	// or any path that intentionally contains high-entropy non-secret data.
+	// Example: ["testdata/**", "**/*_test.go", "**/*.lock"]
+	SecretsScanIgnore []string `koanf:"secrets_scan_ignore"`
 	// AIScan sends the staged diff to an LLM for secret/credential detection (default: false).
 	// More thorough but slower — requires a configured provider.
 	AIScan bool `koanf:"ai_scan"`

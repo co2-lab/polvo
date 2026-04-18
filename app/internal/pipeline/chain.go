@@ -43,3 +43,12 @@ func DefaultChain() []Step {
 func ReviewChain() []string {
 	return []string{"lint", "best-practices", "review"}
 }
+
+// SpecialistRegistry returns a map[agentName]Step for use with Supervisor.
+func SpecialistRegistry() map[string]Step {
+	reg := make(map[string]Step)
+	for _, step := range DefaultChain() {
+		reg[step.Agent] = step
+	}
+	return reg
+}

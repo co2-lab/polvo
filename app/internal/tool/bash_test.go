@@ -428,10 +428,10 @@ func TestBashExecute(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(res.Content) > maxOutputBytes+100 {
+		if len(res.Content) > DefaultMaxObservationChars+200 {
 			t.Errorf("output não foi truncado: len=%d", len(res.Content))
 		}
-		if !strings.Contains(res.Content, "truncated") {
+		if !strings.Contains(res.Content, "truncados") {
 			t.Error("expected truncation message in output")
 		}
 	})

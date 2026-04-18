@@ -258,3 +258,84 @@ func (s *FSStore) LoadBaseState(sessionID string) (BaseState, error) {
 	}
 	return state, nil
 }
+
+// PutPendingWrites persists buffered writes to sessions/<id>/pending_writes.json.
+func (s *FSStore) PutPendingWrites(sessionID string, writes []PendingWrite) error {
+	dir := s.sessionDir(sessionID)
+	if err := ensureDir(dir); err != nil {
+		return err
+	}
+	return writeJSON(filepath.Join(dir, "pending_writes.json"), writes)
+}
+
+// LoadPendingWrites reads pending_writes.json; returns nil if absent.
+func (s *FSStore) LoadPendingWrites(sessionID string) ([]PendingWrite, error) {
+	path := filepath.Join(s.sessionDir(sessionID), "pending_writes.json")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil, nil
+	}
+	var writes []PendingWrite
+	if err := readJSON(path, &writes); err != nil {
+		return nil, err
+	}
+	return writes, nil
+}
+
+// ClearPendingWrites removes pending_writes.json if it exists.
+func (s *FSStore) ClearPendingWrites(sessionID string) error {
+	path := filepath.Join(s.sessionDir(sessionID), "pending_writes.json")
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// SaveSuspendPoint writes suspend_point.json atomically (overwrites each call).
+func (s *FSStore) SaveSuspendPoint(sessionID string, sp SuspendPoint) error {
+	dir := s.sessionDir(sessionID)
+	if err := ensureDir(dir); err != nil {
+		return err
+	}
+	return writeJSON(filepath.Join(dir, "suspend_point.json"), sp)
+}
+
+// LoadSuspendPoint reads suspend_point.json; returns ErrNoSuspendPoint if absent.
+func (s *FSStore) LoadSuspendPoint(sessionID string) (SuspendPoint, error) {
+	path := filepath.Join(s.sessionDir(sessionID), "suspend_point.json")
+	var sp SuspendPoint
+	if err := readJSON(path, &sp); err != nil {
+		return SuspendPoint{}, err
+	}
+	return sp, nil
+}
+
+// DeleteSuspendPoint removes suspend_point.json (called on resume).
+func (s *FSStore) DeleteSuspendPoint(sessionID string) error {
+	path := filepath.Join(s.sessionDir(sessionID), "suspend_point.json")
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// SaveTurnMarks atomically overwrites turn_marks.json for the session.
+func (s *FSStore) SaveTurnMarks(sessionID string, marks []TurnMarkRecord) error {
+	dir := s.sessionDir(sessionID)
+	if err := ensureDir(dir); err != nil {
+		return err
+	}
+	return writeJSON(filepath.Join(dir, "turn_marks.json"), marks)
+}
+
+// LoadTurnMarks reads turn_marks.json; returns nil without error if absent.
+func (s *FSStore) LoadTurnMarks(sessionID string) ([]TurnMarkRecord, error) {
+	path := filepath.Join(s.sessionDir(sessionID), "turn_marks.json")
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil, nil
+	}
+	var marks []TurnMarkRecord
+	if err := readJSON(path, &marks); err != nil {
+		return nil, err
+	}
+	return marks, nil
+}
