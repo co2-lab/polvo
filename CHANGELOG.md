@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.3.2 — 2026-04-18
+
+### Bug Fixes
+
+- Bump app version to 0.3.2 ([#2b412ca](https://github.com/co2-lab/polvo/commit/2b412ca82baec3cdf1a7898753b7111f7d28d0c1))
+
+## v0.3.1 — 2026-04-18
+
+### Bug Fixes
+
+- Embed WebView2 bootstrapper and bump version to 0.3.1 ([#1b83042](https://github.com/co2-lab/polvo/commit/1b830423a2a8fc303ee6bec3bbe0a4b38fa200fa))
+
 ## v0.3.0 — 2026-04-18
 
 ### Bug Fixes
