@@ -2,23 +2,20 @@
 
 ## v0.3.0 — 2026-04-18
 
+### Bug Fixes
+
+- Fix TypeScript errors blocking release build ([#e4dc34e](https://github.com/co2-lab/polvo/commit/e4dc34ee6cced95d48ceaaa8d1037cca875952d8))
+- Remove HTML comments from PolvoIcon JSX ([#830ecdf](https://github.com/co2-lab/polvo/commit/830ecdffa171696c68c53c19c90420858c6e9915))
+- Use complete SVG paths in PolvoIcon and logo-square-20 ([#b5bcccf](https://github.com/co2-lab/polvo/commit/b5bcccf629c7dc2e241b52fb7304550a0219c4a2))
+- Centralize Polvo logo and fix dock order ([#35714e9](https://github.com/co2-lab/polvo/commit/35714e9d0d66e5a16687b8e6d977d05254fafca6))
+
 ### Features
 
-- Agent loop: MCP tools, microagent triggers, checkpoint recording, hooks system, diff preview
-- Context window cache: hybrid lookup (Anthropic API → LiteLLM → OpenRouter → static prefix table)
-- Seq structured logging for dev debugging (CLEF-over-HTTP, zero overhead in prod)
-- Repomap: symbol extraction, PageRank, reranker, and symcache
-- Session manager with resolver and LLM-based summarization
-- Policy engine with file-based store
-- Sandbox execution environment
-- Audit log with SQLite backend
-- Provider fallback chain and SWE benchmark scores
-- Pipeline supervisor for multi-agent orchestration
-- Skill extractor and injector
-- Visual testing framework (screenshot/describe/act)
-- Git: PR creator and commit message generator
-- UI: panel title uniqueness with stable indexing, `ai` panel kind, Warp B&W theme
-- Secret detection: false positive filtering for function calls and quoted strings
+- Implement context window cache with hybrid lookup for models ([#c6a3781](https://github.com/co2-lab/polvo/commit/c6a378182c5e8cb7f016ea5e0d03fbda37575383))
+- Add Seq structured logging for dev debugging ([#557ff07](https://github.com/co2-lab/polvo/commit/557ff07983887261efbfb694c7c44421c4ffa9d2))
+- Add visual testing framework with screenshot, description, and action capabilities ([#56ea0c3](https://github.com/co2-lab/polvo/commit/56ea0c35d7edb21839d7733a3039cd82f950e9d5))
+- Implement roadmap Fase 0+A+B — MCP, microagents, checkpoints, hooks, diff preview ([#c26e0a9](https://github.com/co2-lab/polvo/commit/c26e0a900e5f90dd8d97f49707456dbb937b57c6))
+- Add Polvo dock item, fix Copilot icon, add square logo ([#6e87105](https://github.com/co2-lab/polvo/commit/6e87105a21c0d9c53f16f5903e454f9601b57519))
 
 ## v0.2.0 — 2026-04-14
 
