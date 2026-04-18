@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.3.0 — 2026-04-18
+
+### Features
+
+- Agent loop: MCP tools, microagent triggers, checkpoint recording, hooks system, diff preview
+- Context window cache: hybrid lookup (Anthropic API → LiteLLM → OpenRouter → static prefix table)
+- Seq structured logging for dev debugging (CLEF-over-HTTP, zero overhead in prod)
+- Repomap: symbol extraction, PageRank, reranker, and symcache
+- Session manager with resolver and LLM-based summarization
+- Policy engine with file-based store
+- Sandbox execution environment
+- Audit log with SQLite backend
+- Provider fallback chain and SWE benchmark scores
+- Pipeline supervisor for multi-agent orchestration
+- Skill extractor and injector
+- Visual testing framework (screenshot/describe/act)
+- Git: PR creator and commit message generator
+- UI: panel title uniqueness with stable indexing, `ai` panel kind, Warp B&W theme
+- Secret detection: false positive filtering for function calls and quoted strings
+
 ## v0.2.0 — 2026-04-14
 
 ### Features
