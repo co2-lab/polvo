@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.5 — 2026-04-18
+
+### Bug Fixes
+
+- Update fork user for winget publishing ([#f1e7a95](https://github.com/co2-lab/polvo/commit/f1e7a9559b94c6d4b28a2ff842031a34b372cd7f))
+
 ## v0.3.2 — 2026-04-18
 
 ### Bug Fixes
